@@ -39,7 +39,9 @@ section changes the curve shift automatically to lengthen compressor runs:
   the shift goes up by 1 when the water is within 1 K of the thermo off point
   (target + 3 K), up to *normal + max. shift up*.
 - When the compressor stops, the shift returns to normal, or to *normal − shift
-  down* at night or when the indoor sensor is above the indoor target.
+  down* at night or when the indoor sensor is above the indoor target. While
+  the compressor is off this also happens later, as soon as the night starts
+  or the room gets warmer than the target.
 - When the compressor starts again, the shift returns to normal.
 - **Min. compressor run** (default 120 min, 0 = off): until a run has lasted
   this long, the shift also goes up near thermo off when no heat is needed
@@ -49,7 +51,7 @@ section changes the curve shift automatically to lengthen compressor runs:
 - **Max. compressor pause** (default 180 min, 0 = off): if the compressor stays
   off this long with the shift below normal (shift down) and the room is not
   warmer than the indoor target, the shift returns to normal so the compressor
-  restarts on its own.
+  restarts on its own; it is not lowered again until the compressor has run.
 - Below the *min. outdoor* temperature (default 0 °C) tuning is off and the
   shift returns to normal.
 - During a defrost and for 10 minutes after it, tuning and the night-time

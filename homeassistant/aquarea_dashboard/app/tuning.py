@@ -6,12 +6,15 @@ needs heat ("up" mode), the shift is raised by 1 whenever the water gets within
 1 K of that threshold, up to normal + up_max. When the compressor stops the
 shift goes back to normal, or to normal − down_max in "down" mode (night or
 room warmer than the indoor target), which lowers the target for the next run.
+While the compressor is off, a change to "down" mode (e.g. the room gets warmer
+than the target after the stop) also lowers the shift to normal − down_max.
 When the compressor starts again the shift returns to normal. Until a run has
 lasted min_run_min the +1 steps are also made outside "up" mode (never above
 normal + up_max); after that the shift goes back to normal and the compressor
 stops on its own. If the compressor stays off longer than max_pause_min with
 the shift below normal and the room not warmer than the indoor target, the shift
-goes back to normal so that it restarts on its own. Below the outdoor
+goes back to normal so that it restarts on its own (no shift down again until
+the compressor has run). Below the outdoor
 threshold min_outdoor tuning is off and the shift goes back to normal.
 
 Safety: commands only with --allow-control, heating on and the zone in curve
@@ -459,6 +462,9 @@ class Tuner:
             st.pop("reset_after_on")
         run_min = _run_minutes(obs)
         pause_min = _pause_minutes(obs)
+        pause_key = _iso(obs.compressor_since) if obs.compressor == "OFF" and obs.compressor_since else None
+        # after a max. pause reset no shift down until the compressor has run again
+        pause_reset = pause_key is not None and st.get("pause_reset") == pause_key
         # a run shorter than the minimum gets the up steps in any mode but "off"
         short = mode != "off" and run_min is not None and run_min < s["min_run_min"]
         if short and mode != "up":
@@ -483,12 +489,20 @@ class Tuner:
             and obs.indoor is not None
             and obs.indoor <= s["indoor_target"]
         ):
+            st["pause_reset"] = pause_key
             cmd = Command(
                 normal,
                 obs.shift,
                 f"compressor off for {pause_min} min ≥ max. pause {s['max_pause_min']} min "
                 f"(indoor {_n(obs.indoor)} °C ≤ {_n(s['indoor_target'])} °C)",
             )
+        elif (
+            obs.compressor == "OFF"
+            and mode == "down"
+            and obs.shift > normal - s["down_max"]
+            and not pause_reset
+        ):
+            cmd = Command(normal - s["down_max"], obs.shift, f"compressor off, {why}: shift down")
         elif obs.compressor == "ON" and mode != "up" and not short and obs.shift > normal:
             reason = f"no more heat needed ({why})"
             if run_min is not None and s["min_run_min"]:
