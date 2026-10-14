@@ -1,5 +1,5 @@
 name: Aquarea Dashboard
-version: "0.1.41"
+version: "0.1.42"
 slug: aquarea_dashboard
 description: Panasonic Aquarea heat pump dashboard with history logging and optional heating control
 arch:

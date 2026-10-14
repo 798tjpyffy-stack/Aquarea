@@ -42,7 +42,8 @@ section changes the curve shift automatically to lengthen compressor runs:
   down* at night or when the indoor sensor is above the indoor target. While
   the compressor is off this also happens later, as soon as the night starts
   or the room gets warmer than the target.
-- When the compressor starts again, the shift returns to normal.
+- When the compressor starts again, the shift returns to normal (also later
+  while it runs, should that command have been skipped or failed).
 - **Min. compressor run** (default 120 min, 0 = off): until a run has lasted
   this long, the shift also goes up near thermo off when no heat is needed
   (night, warm room), never above *normal + max. shift up* (so a run can still

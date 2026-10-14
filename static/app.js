@@ -868,7 +868,7 @@ function buildTuningView(deviceId) {
       "within 1 K of the thermo off point (target + 3 K), up to normal + max. When the compressor stops, the shift " +
       "goes back to normal, or down by \u201cshift down\u201d at night or when the room is warmer than the indoor target " +
       "(also later while it is off, as soon as that applies); " +
-      "when it starts again, back to normal. Until a run reaches the minimum run time the shift also goes up in " +
+      "when it starts again (or runs with the shift below normal), back to normal. Until a run reaches the minimum run time the shift also goes up in " +
       "down mode (never above normal + max); after that it goes back to normal and the compressor stops on its own. " +
       "If the compressor stays off longer than the maximum pause with the shift lowered and the room is not " +
       "warmer than the indoor target, the shift goes back to normal so it restarts on its own (no shift down again " +

@@ -8,7 +8,8 @@ shift goes back to normal, or to normal − down_max in "down" mode (night or
 room warmer than the indoor target), which lowers the target for the next run.
 While the compressor is off, a change to "down" mode (e.g. the room gets warmer
 than the target after the stop) also lowers the shift to normal − down_max.
-When the compressor starts again the shift returns to normal. Until a run has
+When the compressor starts again the shift returns to normal (also later while
+it runs, should that command have been skipped or failed). Until a run has
 lasted min_run_min the +1 steps are also made outside "up" mode (never above
 normal + up_max); after that the shift goes back to normal and the compressor
 stops on its own. If the compressor stays off longer than max_pause_min with
@@ -520,6 +521,8 @@ class Tuner:
             cmd = Command(value, obs.shift, f"compressor stopped ({why})")
         elif prev == "OFF" and obs.compressor == "ON":
             cmd = Command(normal, obs.shift, "compressor started")
+        elif obs.compressor == "ON" and obs.shift < normal:  # also retries a skipped/failed start reset
+            cmd = Command(normal, obs.shift, "compressor running with the shift below normal")
         elif (
             obs.compressor == "OFF"
             and obs.shift < normal
