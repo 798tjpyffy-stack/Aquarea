@@ -47,8 +47,8 @@ section changes the curve shift automatically to lengthen compressor runs:
   end earlier). After that the shift returns to normal and the compressor stops
   on its own.
 - **Max. compressor pause** (default 180 min, 0 = off): if the compressor stays
-  off this long with the shift below normal (shift down) and the room is warmer
-  than the indoor target, the shift returns to normal so the compressor
+  off this long with the shift below normal (shift down) and the room is not
+  warmer than the indoor target, the shift returns to normal so the compressor
   restarts on its own.
 - Below the *min. outdoor* temperature (default 0 °C) tuning is off and the
   shift returns to normal.

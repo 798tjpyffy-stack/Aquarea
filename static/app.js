@@ -773,7 +773,7 @@ function buildTuningView(deviceId) {
     field("Max. shift up", f.up_max, "steps above normal while heat is needed"),
     field("Shift down", f.down_max, "below normal after a stop (night / warm)"),
     field("Min. compressor run, min.", f.min_run_min, "shift up (within max.) until a run lasts this long; 0 = off"),
-    field("Max. compressor pause, min.", f.max_pause_min, "then, if the room is above target, a shift below normal goes back to normal; 0 = off"),
+    field("Max. compressor pause, min.", f.max_pause_min, "then, if the room is at or below target, a shift below normal goes back to normal; 0 = off"),
     field("Indoor target °C", f.indoor_target, "warmer = down mode"),
     field("Min. outdoor °C", f.min_outdoor, "colder = no tuning, normal shift"),
     field("Night from", f.night_start),
@@ -794,8 +794,8 @@ function buildTuningView(deviceId) {
       "goes back to normal, or down by \u201cshift down\u201d at night or when the room is warmer than the indoor target; " +
       "when it starts again, back to normal. Until a run reaches the minimum run time the shift also goes up in " +
       "down mode (never above normal + max); after that it goes back to normal and the compressor stops on its own. " +
-      "If the compressor stays off longer than the maximum pause with the shift lowered and the room is warmer " +
-      "than the indoor target, the shift goes back to normal so it restarts on its own. " +
+      "If the compressor stays off longer than the maximum pause with the shift lowered and the room is not " +
+      "warmer than the indoor target, the shift goes back to normal so it restarts on its own. " +
       "Below the minimum outdoor temperature tuning is off and the shift " +
       "stays at normal. A shift changed elsewhere pauses tuning. Night-time shutoff turns the whole unit (including " +
       "hot water) off for the night hours when the forecast mean of the following day is above the threshold and " +
