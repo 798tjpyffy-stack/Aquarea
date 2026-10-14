@@ -1,0 +1,8 @@
+.venv/
+.env
+output/
+data/
+__pycache__/
+token
+.DS_Store
+*.bak

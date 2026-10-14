@@ -1,0 +1,2 @@
+aioaquarea==1.0.7
+python-dotenv>=1.0

@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Aquarea Dashboard</title>
+  <link rel="stylesheet" href="static/style.css">
+  <script src="static/app.js" defer></script>
+</head>
+<body>
+  <header>
+    <h1>Aquarea Dashboard</h1>
+    <div id="toolbar" hidden>
+      <label><input type="checkbox" id="opt-consumption" checked> Energy data</label>
+      <button id="btn-refresh" type="button">Refresh</button>
+      <button id="btn-download" type="button">Download JSON</button>
+    </div>
+    <div id="account">
+      <span id="user">Not signed in</span>
+      <button id="btn-show-login" type="button">Log in</button>
+      <button id="btn-logout" type="button" class="secondary" title="Stops auto-update and deletes the stored token" hidden>Log out</button>
+    </div>
+  </header>
+
+  <main>
+    <section id="login-view" hidden>
+      <form id="login-form" class="card login">
+        <h2>Sign in</h2>
+        <p class="muted">Use your Panasonic Aquarea Smart Cloud account.</p>
+        <label>Email
+          <input type="email" id="username" autocomplete="username" required>
+        </label>
+        <label>Password
+          <input type="password" id="password" autocomplete="current-password" required>
+        </label>
+        <button type="submit" id="btn-login">Sign in</button>
+        <p id="login-error" class="error" hidden></p>
+      </form>
+    </section>
+
+    <section id="app-view" hidden>
+      <p id="status-line" class="muted"></p>
+      <p id="app-error" class="error" hidden></p>
+      <div id="devices"></div>
+    </section>
+  </main>
+</body>
+</html>
