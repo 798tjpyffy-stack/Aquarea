@@ -95,6 +95,7 @@ h2.device-title { margin: 8px 0 14px; }
 .tile .control { margin-top: 10px; padding-top: 8px; border-top: 1px dashed var(--border); }
 .tile .control-row { display: flex; gap: 6px; margin-top: 4px; }
 .tile .control input { width: 70px; padding: 5px 6px; border: 1px solid var(--border); border-radius: 6px; font: inherit; }
+.tile .control input[type=radio], .tile .control input[type=checkbox] { width: auto; padding: 0; }
 .tile .control select { padding: 5px 6px; border: 1px solid var(--border); border-radius: 6px; font: inherit; }
 .tile .control button { padding: 5px 10px; }
 

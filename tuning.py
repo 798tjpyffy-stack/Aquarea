@@ -36,6 +36,13 @@ When it reports on again after the dashboard turned it on, the shift (still
 lowered from the night) goes back to normal. Within
 night_off_early_min minutes before the night this can already happen, so the
 compressor does not start once more just before.
+
+Early off (manual, e.g. wood stove or sun): from now until a chosen time the
+same applies as during a shutoff night, without the forecast conditions and
+the night_off switch: "down" mode (runs still reach min_run_min), shutoff once
+the compressor has been off for night_off_early_wait_min, on again at the end.
+No max. pause reset during early off. An overlapping shutoff night continues
+without turning the unit on in between.
 """
 
 from __future__ import annotations
@@ -255,6 +262,21 @@ def _pause_minutes(obs: Observation) -> int | None:
     return max(0, int((obs.now - obs.compressor_since).total_seconds() // 60))
 
 
+def _early_off(state: dict[str, Any], now: dt.datetime) -> tuple[dt.datetime, dt.datetime] | None:
+    """(since, until) of an active early off."""
+    eo = state.get("early_off")
+    if not isinstance(eo, dict):
+        return None
+    since, until = _parse(eo.get("since")), _parse(eo.get("until"))
+    if since is None or until is None or not now < until:
+        return None
+    return since, until
+
+
+def _early_off_text(until: dt.datetime) -> str:
+    return f"early off until {until.astimezone():%a %H:%M}"
+
+
 class Tuner:
     """Settings, state and log per device, stored in a JSON file (mode 600)."""
 
@@ -343,7 +365,24 @@ class Tuner:
                 **self._night_live.get(device_id, {}),
                 "active": bool((st.get("night_off") or {}).get("active")),
             },
+            "early_off": (
+                {"since": _iso(eo[0]), "until": _iso(eo[1])}
+                if (eo := _early_off(st, dt.datetime.now().astimezone()))
+                else None
+            ),
         }
+
+    def start_early_off(self, device_id: str, until: dt.datetime, now: dt.datetime) -> None:
+        entry = self.entry(device_id)
+        entry["state"]["early_off"] = {"since": _iso(now), "until": _iso(until)}
+        self._log(entry, now, "early off", f"Early off started, until {until.astimezone():%a %d.%m. %H:%M}")
+        self.save()
+
+    def cancel_early_off(self, device_id: str, now: dt.datetime) -> None:
+        entry = self.entry(device_id)
+        if entry["state"].pop("early_off", None) is not None:
+            self._log(entry, now, "early off", "Early off ended manually")
+            self.save()
 
     # ------------------------------------------------------------------ settings
     def update_settings(self, device_id: str, settings: dict[str, Any], now: dt.datetime) -> None:
@@ -413,9 +452,10 @@ class Tuner:
             if st.get("commanded") is not None and not st.get("confirmed"):
                 st["commanded_at"] = _iso(now)
             return None
+        early_off = _early_off(st, now)
         if not s["enabled"]:
             st.pop("reset_after_on", None)
-            mode, why = self._mode(s, obs)
+            mode, why = self._mode(s, obs, early_off)
             live["mode"] = "disabled"
             live["note"] = f"would be {mode}: {why}" if ready and obs.operation_on else (
                 "Zone 1 not in curve mode or status unavailable" if not ready else "heating off"
@@ -451,7 +491,7 @@ class Tuner:
         if not obs.operation_on:
             live["mode"], live["note"] = "idle", "heating off"
             return None
-        mode, why = self._mode(s, obs)
+        mode, why = self._mode(s, obs, early_off)
         live["mode"], live["note"] = mode, why
         if not obs.control:
             live["note"] = f"{why} · control disabled (--allow-control)"
@@ -474,7 +514,7 @@ class Tuner:
             if obs.shift != normal:
                 cmd = Command(normal, obs.shift, f"{why}: back to normal shift")
         elif st.get("reset_after_on"):
-            cmd = Command(normal, obs.shift, "unit turned on after the night-time shutoff: back to normal shift")
+            cmd = Command(normal, obs.shift, "unit turned on after the shutoff: back to normal shift")
         elif prev == "ON" and obs.compressor == "OFF":
             value = normal - s["down_max"] if mode == "down" else normal
             cmd = Command(value, obs.shift, f"compressor stopped ({why})")
@@ -488,6 +528,7 @@ class Tuner:
             and pause_min >= s["max_pause_min"]
             and obs.indoor is not None
             and obs.indoor <= s["indoor_target"]
+            and early_off is None
         ):
             st["pause_reset"] = pause_key
             cmd = Command(
@@ -547,9 +588,13 @@ class Tuner:
         return cmd
 
     @staticmethod
-    def _mode(s: dict[str, Any], obs: Observation) -> tuple[str, str]:
+    def _mode(
+        s: dict[str, Any], obs: Observation, early_off: tuple[dt.datetime, dt.datetime] | None = None
+    ) -> tuple[str, str]:
         if obs.outdoor is not None and obs.outdoor < s["min_outdoor"]:
             return "off", f"outdoor {_n(obs.outdoor)} °C < {_n(s['min_outdoor'])} °C"
+        if early_off is not None:
+            return "down", _early_off_text(early_off[1])
         if in_night(s, obs.now):
             return "down", f"night {s['night_start']}–{s['night_end']}"
         if obs.indoor is None:
@@ -657,18 +702,35 @@ class Tuner:
         )
         key = _iso(window[0]) if window else None
         ok, why = night_off_conditions(s, fc)
+        enabled = s["night_off"]
+        eo = _early_off(entry["state"], now)
+        if eo is None and "early_off" in entry["state"]:
+            entry["state"].pop("early_off")
+            self._log(entry, now, "early off", "Early off time over")
+        if eo is not None:  # treated like a shutoff night from its start until its end
+            window, in_night, early = eo, True, False
+            key, ok, why, enabled = f"early off {_iso(eo[0])}", True, _early_off_text(eo[1]), True
         if not obs.status_ok:
             live["note"] = "unit status unavailable"
             return None
         last = _parse(no.get("last_power_at"))
         wait = last is not None and now - last < POWER_RETRY
 
+        if no.get("active") and no.get("night") != key and (in_night or early) and enabled and ok:
+            # overlapping early off / shutoff night: the unit stays off
+            self._log(entry, now, "power", f"Unit stays off: {why}")
+            no["night"] = key
         if no.get("active"):
             if not (in_night or early) or no.get("night") != key:
-                end_reason = "night over"
-            elif not s["night_off"]:
+                end_reason = "early off over" if str(no.get("night")).startswith("early off") else "night over"
+            elif not enabled:
                 end_reason = "night-time shutoff disabled"
-            elif fc and fc.get("night_min") is not None and fc["night_min"] < s["night_off_min_low"]:
+            elif (
+                eo is None
+                and fc
+                and fc.get("night_min") is not None
+                and fc["night_min"] < s["night_off_min_low"]
+            ):
                 end_reason = f"forecast night minimum {_n(fc['night_min'])} °C < {_n(s['night_off_min_low'])} °C"
             else:
                 end_reason = None
@@ -711,7 +773,7 @@ class Tuner:
                 no["confirmed"] = True
                 self._log(entry, now, "power", "Unit reports off")
             if end_reason is None:
-                live["note"] = f"unit off until {window[1]:%H:%M} ({why})"
+                live["note"] = f"unit off: {why}" if eo else f"unit off until {window[1]:%H:%M} ({why})"
                 return None
             if not obs.control:
                 live["note"] = f"{end_reason}, but control is disabled (--allow-control)"
@@ -724,7 +786,7 @@ class Tuner:
         if no.get("night") != key:
             no.clear()
             no["night"] = key
-        if not s["night_off"]:
+        if not enabled:
             live["note"] = "disabled" + (f" (would turn off: {why})" if ok else "")
             return None
         if not in_night and not early:
@@ -732,7 +794,7 @@ class Tuner:
             live["note"] = f"{when}: " + (f"unit will be turned off ({why})" if ok else f"stays on ({why})")
             return None
         if no.get("done"):
-            live["note"] = "no more shutoff this night"
+            live["note"] = "no more shutoff during this early off" if eo else "no more shutoff this night"
             return None
         if not ok:
             live["note"] = f"stays on ({why})"
@@ -740,7 +802,7 @@ class Tuner:
         if not obs.unit_on:
             live["note"] = "unit already off (not turned off by the dashboard)"
             return None
-        prefix = "night" if in_night else f"night from {window[0]:%H:%M}"
+        prefix = why if eo else "night" if in_night else f"night from {window[0]:%H:%M}"
         wait_min = s["night_off_early_wait_min"]
         # never cut a run short: off only once the compressor has been off for the wait time
         if obs.compressor == "ON":
@@ -749,6 +811,9 @@ class Tuner:
                 f"{prefix}: compressor running{f' for {run} min' if run is not None else ''}; "
                 f"shutoff {wait_min} min after it stops"
             )
+            return None
+        if obs.compressor is None and eo:
+            live["note"] = f"{prefix}: compressor state unknown, waiting"
             return None
         if obs.compressor is None and early:
             live["note"] = f"{prefix}: compressor state unknown, shutoff at the start of the night"
@@ -759,7 +824,9 @@ class Tuner:
             live["note"] = f"{prefix}: compressor stopped at {stop:%H:%M}, shutoff at {settle_until:%H:%M}"
             return None
         reason = f"night-time shutoff: {why}"
-        if early:
+        if eo:
+            reason = f"{why}, compressor off"
+        elif early:
             reason = f"early night-time shutoff, night from {window[0]:%H:%M} and compressor off: {why}"
         if not obs.control:
             live["note"] = f"would turn off ({reason}), but control is disabled (--allow-control)"

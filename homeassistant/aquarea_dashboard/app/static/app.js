@@ -90,6 +90,7 @@ function overviewTiles(dev) {
   const direction = status?.direction?.name ?? "–";
   tiles.append(tile("Operation", operation, `Mode: ${mode} · Direction: ${direction}`));
   if (allowControl && status) tiles.lastChild.append(powerControl(dev.info.device_id, operation === "ON"));
+  if (allowControl && dev.tuning) tiles.lastChild.append(earlyOffView(dev));
 
   let outdoor = num(status?.temperature_outdoor);
   let outdoorSrc = "live status";
@@ -192,6 +193,80 @@ function powerControl(deviceId, isOn) {
   });
   return el("div", { class: "control" }, el("div", { class: "control-row" }, btn));
 }
+
+const untilText = (iso) => new Date(iso).toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit" });
+
+// Cached per device so that the open form and its input survive re-renders.
+const earlyOffViews = new Map();
+function earlyOffView(dev) {
+  const deviceId = dev.info.device_id;
+  let view = earlyOffViews.get(deviceId);
+  if (!view) {
+    view = buildEarlyOffView(deviceId);
+    earlyOffViews.set(deviceId, view);
+  }
+  view.update(dev.tuning);
+  return view.node;
+}
+
+function buildEarlyOffView(deviceId) {
+  const name = `early-off-${deviceId}`;
+  const morning = el("input", { type: "radio", name, value: "morning" });
+  const forHours = el("input", { type: "radio", name, value: "hours" });
+  const hours = el("input", { type: "number", min: "0.5", max: "48", step: "0.5", value: "12", "aria-label": "Hours" });
+  morning.checked = true;
+  hours.addEventListener("input", () => { forHours.checked = true; });
+  const morningText = el("span");
+  const start = el("button", { type: "button", text: "Start early off" });
+  const stop = el("button", { type: "button", text: "End early off" });
+  const status = el("div", { class: "sub" });
+  const form = el("div", { class: "quiet-form" },
+    el("label", { class: "check" }, morning, morningText),
+    el("label", { class: "check" }, forHours, el("span", { text: "For" }), hours, el("span", { text: "hours" })),
+    start);
+  const details = el("details", {}, el("summary", { text: "Early off (wood stove / sun)" }), form);
+  const stopRow = el("div", { class: "control-row" }, stop);
+  const node = el("div", { class: "control" }, status, details, stopRow);
+
+  async function send(body, btn) {
+    btn.disabled = true;
+    try {
+      await postJSON("api/early-off", { device_id: deviceId, ...body });
+      details.open = false;
+      await loadReport();
+    } catch (e) {
+      if (e.status === 401) return showLogin(e.message);
+      showAppError(e.message);
+    } finally {
+      btn.disabled = false;
+    }
+  }
+  start.addEventListener("click", () => {
+    const h = Number(hours.value);
+    if (forHours.checked && !(h >= 0.5 && h <= 48)) return showAppError("Hours must be between 0.5 and 48.");
+    const until = forHours.checked ? `for ${h} h` : morningText.textContent.toLowerCase();
+    if (!confirm(`Start early off ${until}? The unit (including hot water) is turned off once the compressor ` +
+      "has stopped and stayed off for the shutoff wait time, and turned back on at the end.")) return;
+    send(forHours.checked ? { action: "hours", hours: h } : { action: "morning" }, start);
+  });
+  stop.addEventListener("click", () => {
+    if (!confirm("End early off? A unit turned off by it is turned back on (unless the night-time shutoff applies).")) return;
+    send({ action: "cancel" }, stop);
+  });
+
+  return {
+    node,
+    update(t) {
+      const eo = t.early_off;
+      morningText.textContent = `Until the end of the night (${t.settings.night_end})`;
+      status.textContent = eo ? `Early off until ${untilText(eo.until)}: ${t.night_off?.note ?? "–"}` : "";
+      status.hidden = !eo;
+      details.hidden = Boolean(eo);
+      stopRow.hidden = !eo;
+    },
+  };
+}
+
 // "Off for 1 h 5 min (since 12:30) · last run 42 min" / "Running for 20 min (started 12:30)";
 // "more than" if the run reaches back to a data gap.
 function compressorRunText(comp) {
@@ -804,7 +879,9 @@ function buildTuningView(deviceId) {
       "the night minimum is not below its limit, and back on at the end of the night. It turns the unit off only " +
       "when the compressor has been off for the wait time (a run is not cut short); when it is back on in the " +
       "morning the shift goes back to normal. " +
-      "Within the early shutoff time before the night this can already happen, avoiding a last short run." }),
+      "Within the early shutoff time before the night this can already happen, avoiding a last short run. " +
+      "Early off (Operation tile) does the same from now until the end of the night or for a number of hours, " +
+      "without the forecast conditions; no max. pause reset meanwhile." }),
     form, allowControl ? buttons : el("p", { class: "muted", text: "Read-only: start the server with --allow-control to change these settings." }),
     status, log), true);
   let dirty = false, settings = null, sensorsKey = "";
@@ -851,6 +928,7 @@ function buildTuningView(deviceId) {
       ["Compressor (est.)", st.compressor ?? "–"],
       ["Forecast", forecastText(t.night_off?.forecast)],
       ["Night-time shutoff", `${t.night_off?.active ? "Unit off – " : ""}${t.night_off?.note ?? "–"}`],
+      ["Early off", t.early_off ? `until ${untilText(t.early_off.until)}` : "–"],
       ["Last check", live.checked_at ? new Date(live.checked_at).toLocaleString() : "–"],
     ];
     status.replaceChildren(el("table", { class: "kv" }, el("tbody", {},

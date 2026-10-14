@@ -92,6 +92,20 @@ night should it report off later.
 night the unit can already be turned off (same compressor rule), so it doesn't
 start once more for a short run just before the night.
 
+### Early off
+
+For when the pump is not needed, e.g. the wood stove is burning or the sun has
+made it too warm: **Early off** in the Operation tile starts a shutoff now,
+either until the end of the night hours or for a number of hours (default 12).
+It works like a shutoff night that starts now, without the forecast conditions
+and the night-time shutoff switch: the tuning runs in down mode (a running
+compressor still reaches the min. run, then the shift goes back to normal so it
+stops on its own, then down), the unit is turned off once the compressor has
+been off for the wait time, and turned back on at the end (the shift goes back
+to normal). There is no max. pause reset during early off. If a shutoff night
+overlaps, the unit stays off in between. **End early off** turns a unit it
+turned off back on at once (unless a shutoff night applies).
+
 ## Quiet mode auto
 
 "Auto settings" in the Quiet mode tile sets the quiet level from the outdoor

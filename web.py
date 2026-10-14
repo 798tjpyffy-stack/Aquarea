@@ -713,6 +713,50 @@ async def api_tuning(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "tuning": tuner.public(device_id)})
 
 
+async def api_early_off(request: web.Request) -> web.Response:
+    """Start (until the end of the night or for some hours) or end an early off."""
+    if not request.app[ALLOW_CONTROL]:
+        return web.json_response(
+            {"error": "Control is disabled. Start the server with --allow-control."}, status=403
+        )
+    _require_json(request)
+    session = _get_session(request)
+    if session is None:
+        return web.json_response({"error": "Not logged in."}, status=401)
+    try:
+        body = await request.json()
+    except ValueError:
+        raise web.HTTPBadRequest(text="Invalid JSON")
+    if not isinstance(body, dict):
+        return web.json_response({"error": "JSON object required."}, status=400)
+    device_id = body.get("device_id")
+    known = {d.get("info", {}).get("device_id") for d in (session.last_report or {}).get("devices", [])}
+    if not isinstance(device_id, str) or device_id not in known:
+        return web.json_response({"error": "Unknown device."}, status=404)
+    tuner = request.app[TUNER]
+    now = dt.datetime.now().astimezone()
+    action = body.get("action")
+    if action == "cancel":
+        _LOGGER.warning("CONTROL %s: early off device %s ended", session.client.username, device_id)
+        tuner.cancel_early_off(device_id, now)
+    elif action == "morning":
+        window = tuning.night_window(tuner.entry(device_id)["settings"], now)
+        if window is None:
+            return web.json_response({"error": "No night hours set: choose a duration."}, status=400)
+        _LOGGER.warning("CONTROL %s: early off device %s until %s", session.client.username, device_id, window[1])
+        tuner.start_early_off(device_id, window[1], now)
+    elif action == "hours":
+        hours = body.get("hours")
+        if isinstance(hours, bool) or not isinstance(hours, (int, float)) or not 0.5 <= hours <= 48:
+            return web.json_response({"error": "hours must be a number between 0.5 and 48."}, status=400)
+        until = now + dt.timedelta(hours=hours)
+        _LOGGER.warning("CONTROL %s: early off device %s until %s", session.client.username, device_id, until)
+        tuner.start_early_off(device_id, until, now)
+    else:
+        return web.json_response({"error": "action must be morning, hours or cancel."}, status=400)
+    return web.json_response({"ok": True, "tuning": tuner.public(device_id)})
+
+
 # --------------------------------------------------------------------------- #
 # App
 # --------------------------------------------------------------------------- #
@@ -805,6 +849,7 @@ def create_app(
     app.router.add_post("/api/device/quiet-mode", api_device_quiet_mode)
     app.router.add_post("/api/quiet-auto", api_quiet_auto)
     app.router.add_post("/api/tuning", api_tuning)
+    app.router.add_post("/api/early-off", api_early_off)
     app.router.add_static("/static/", STATIC_DIR)
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
