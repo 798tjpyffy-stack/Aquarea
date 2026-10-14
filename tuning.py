@@ -10,9 +10,9 @@ When the compressor starts again the shift returns to normal. Until a run has
 lasted min_run_min the +1 steps are also made outside "up" mode (never above
 normal + up_max); after that the shift goes back to normal and the compressor
 stops on its own. If the compressor stays off longer than max_pause_min with
-the shift below normal, the shift goes back to normal so that it restarts on
-its own. Below the outdoor threshold min_outdoor tuning is off and the
-shift goes back to normal.
+the shift below normal and the room warmer than the indoor target, the shift
+goes back to normal so that it restarts on its own. Below the outdoor
+threshold min_outdoor tuning is off and the shift goes back to normal.
 
 Safety: commands only with --allow-control, heating on and the zone in curve
 mode; at most one +1 step per MIN_STEP and only after the unit reports the
@@ -480,9 +480,14 @@ class Tuner:
             and s["max_pause_min"]
             and pause_min is not None
             and pause_min >= s["max_pause_min"]
+            and obs.indoor is not None
+            and obs.indoor > s["indoor_target"]
         ):
             cmd = Command(
-                normal, obs.shift, f"compressor off for {pause_min} min ≥ max. pause {s['max_pause_min']} min"
+                normal,
+                obs.shift,
+                f"compressor off for {pause_min} min ≥ max. pause {s['max_pause_min']} min "
+                f"(indoor {_n(obs.indoor)} °C > {_n(s['indoor_target'])} °C)",
             )
         elif obs.compressor == "ON" and mode != "up" and not short and obs.shift > normal:
             reason = f"no more heat needed ({why})"
