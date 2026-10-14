@@ -93,6 +93,13 @@ night should it report off later.
 night the unit can already be turned off (same compressor rule), so it doesn't
 start once more for a short run just before the night.
 
+**Prevent unnecessary last run** (checkbox, up to 180 min before the night by
+default): within this time before the night the unit can also be turned off
+(same compressor rule) if the indoor temperature, projected to the start of
+the night with its trend over the last 90 min, is still at or above the indoor
+target. A rising trend counts as flat. Without at least 45 min of indoor
+readings no projection is made.
+
 ### Early off
 
 For when the pump is not needed, e.g. the wood stove is burning or the sun has

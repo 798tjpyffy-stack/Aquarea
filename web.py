@@ -35,7 +35,7 @@ import tuning
 from aquarea_report import CONSUMPTION_PERIODS, build_report, parse_heat_curve, raw_device_list_entry, water_target
 from forecast import Forecast, parse_location
 from ha_sensors import HAConfig, fetch_sensors
-from history import append_rows, count_rising_edges, extract_rows, read_rows
+from history import HA_PREFIX, append_rows, count_rising_edges, extract_rows, read_rows
 from token_store import PersistentClient, TokenStore
 
 _LOGGER = logging.getLogger("aquarea_web")
@@ -220,6 +220,10 @@ def _observe(app: web.Application, report: dict[str, Any], dev: dict[str, Any]) 
         {},
     )
     indoor = sensor.get("value")
+    column = f"{HA_PREFIX}{settings['indoor_sensor']}"
+    indoor_points = [
+        (dt.datetime.fromisoformat(r["timestamp"]), r[column]) for r in rows if _is_number(r.get(column))
+    ]
     extra = dev.get("status_extra") or {}
     direction = (status.get("direction") or {}).get("name") if isinstance(status.get("direction"), dict) else None
     # The operation mode stays e.g. HEAT when the unit is switched off; the zones go OFF
@@ -247,6 +251,7 @@ def _observe(app: web.Application, report: dict[str, Any], dev: dict[str, Any]) 
         defrost=extra.get("defrost") == 1,
         quiet=_strict_int((status.get("quiet_mode") or {}).get("value")) if isinstance(status.get("quiet_mode"), dict) else None,
         hold_until=compressor.defrost_hold_until(rows, now, extra.get("defrost") == 1),
+        indoor_trend=tuning.indoor_trend(indoor_points, now),
     )
 
 

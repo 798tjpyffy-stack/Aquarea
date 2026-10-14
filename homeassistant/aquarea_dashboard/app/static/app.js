@@ -837,6 +837,8 @@ function buildTuningView(deviceId) {
     night_off_min_low: numberInput("-30", "15", "0.5"),
     night_off_early_min: numberInput("0", "180", "5"),
     night_off_early_wait_min: numberInput("0", "120", "5"),
+    night_off_trend: el("input", { type: "checkbox" }),
+    night_off_trend_min: numberInput("0", "360", "15"),
   };
   const field = (label, input, hint) =>
     el("label", {}, el("span", { text: label }), input, hint ? el("small", { class: "muted", text: hint }) : null);
@@ -858,7 +860,10 @@ function buildTuningView(deviceId) {
     field("Shutoff if tomorrow's mean above °C", f.night_off_min_mean, "forecast mean of the day after the night"),
     field("No shutoff if night min. below °C", f.night_off_min_low, "forecast lowest temperature of the night"),
     field("Early shutoff, min. before night", f.night_off_early_min, "only while the compressor is off; 0 = never"),
-    field("Shutoff wait after compressor stop, min.", f.night_off_early_wait_min, "unit stays on this long after the last stop"));
+    field("Shutoff wait after compressor stop, min.", f.night_off_early_wait_min, "unit stays on this long after the last stop"),
+    el("label", { class: "check" }, f.night_off_trend, el("span", { text: "Prevent unnecessary last run (indoor trend)" })),
+    field("… up to min. before night", f.night_off_trend_min,
+      "off earlier if the room, projected with its falling trend, stays at or above the target until the night"));
   const buttons = el("div", { class: "control-row" }, save, discard);
   const status = el("div");
   const log = el("div");
@@ -880,6 +885,8 @@ function buildTuningView(deviceId) {
       "when the compressor has been off for the wait time (a run is not cut short); when it is back on in the " +
       "morning the shift goes back to normal. " +
       "Within the early shutoff time before the night this can already happen, avoiding a last short run. " +
+      "With \u201cprevent unnecessary last run\u201d this can happen up to the set time before the night if the room, " +
+      "projected with its falling trend (last 90 min), is still at or above the indoor target at the start of the night. " +
       "Early off (Operation tile) does the same from now until the end of the night or for a number of hours, " +
       "without the forecast conditions; no max. pause reset meanwhile." }),
     form, allowControl ? buttons : el("p", { class: "muted", text: "Read-only: start the server with --allow-control to change these settings." }),
@@ -906,8 +913,9 @@ function buildTuningView(deviceId) {
     settings = s;
     f.enabled.checked = s.enabled;
     f.night_off.checked = s.night_off;
+    f.night_off_trend.checked = s.night_off_trend;
     for (const k of ["normal_shift", "up_max", "down_max", "min_run_min", "max_pause_min", "indoor_target", "min_outdoor", "night_start", "night_end",
-      "night_off_min_mean", "night_off_min_low", "night_off_early_min", "night_off_early_wait_min"]) f[k].value = String(s[k]);
+      "night_off_min_mean", "night_off_min_low", "night_off_early_min", "night_off_early_wait_min", "night_off_trend_min"]) f[k].value = String(s[k]);
     fillSensors(s.indoor_sensor);
     f.indoor_sensor.value = s.indoor_sensor;
     dirty = false;
@@ -923,7 +931,8 @@ function buildTuningView(deviceId) {
       ["Mode", live.mode ? `${live.mode}${live.note ? ` \u2013 ${live.note}` : ""}` : "–"],
       ["Shift", `${sign(shift)}${t.settings.enabled && typeof st.commanded === "number"
         ? ` \u00b7 commanded ${sign(st.commanded)}${st.confirmed ? "" : " (waiting for the unit)"}` : ""}`],
-      ["Indoor", typeof live.indoor === "number" ? `${live.indoor} °C (target ${t.settings.indoor_target} °C)` : "–"],
+      ["Indoor", typeof live.indoor === "number" ? `${live.indoor} °C (target ${t.settings.indoor_target} °C)${
+        typeof live.indoor_trend === "number" ? ` · trend ${live.indoor_trend > 0 ? "+" : ""}${live.indoor_trend.toFixed(2)} K/h` : ""}` : "–"],
       ["Outdoor", typeof live.outdoor === "number" ? `${live.outdoor} °C (min. ${t.settings.min_outdoor} °C)` : "–"],
       ["Compressor (est.)", st.compressor ?? "–"],
       ["Forecast", forecastText(t.night_off?.forecast)],
@@ -964,6 +973,8 @@ function buildTuningView(deviceId) {
       night_off_min_low: Number(f.night_off_min_low.value),
       night_off_early_min: Number(f.night_off_early_min.value),
       night_off_early_wait_min: Number(f.night_off_early_wait_min.value),
+      night_off_trend: f.night_off_trend.checked,
+      night_off_trend_min: Number(f.night_off_trend_min.value),
     };
     if (body.night_off && !settings?.night_off &&
         !confirm("Enable night-time shutoff? The dashboard will turn the whole unit off during the night hours.")) return;

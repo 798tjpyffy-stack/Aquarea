@@ -36,7 +36,11 @@ night_off_early_wait_min (a run is never cut short, it may last into the night).
 When it reports on again after the dashboard turned it on, the shift (still
 lowered from the night) goes back to normal. Within
 night_off_early_min minutes before the night this can already happen, so the
-compressor does not start once more just before.
+compressor does not start once more just before. With night_off_trend ("prevent
+an unnecessary last run") the same can happen up to night_off_trend_min before
+the night if the indoor temperature, projected with its falling trend (least
+squares over TREND_WINDOW; a rising trend counts as flat), is still at or above
+the indoor target at the start of the night.
 
 Early off (manual, e.g. wood stove or sun): from now until a chosen time the
 same applies as during a shutoff night, without the forecast conditions and
@@ -79,6 +83,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "night_off_min_low": -4,  # °C, forecast night minimum must not be below
     "night_off_early_min": 60,  # min before the night: off early while the compressor is off (0 = never)
     "night_off_early_wait_min": 30,  # min after the last compressor stop before turning off
+    "night_off_trend": False,  # prevent an unnecessary last run (indoor trend)
+    "night_off_trend_min": 180,  # min before the night: off if the room stays at/above target until then
 }
 LOG_LIMIT = 200
 PUBLIC_LOG = 20
@@ -90,6 +96,10 @@ MAX_OFF_ATTEMPTS = 3
 MIN_EVAL_INTERVAL = dt.timedelta(seconds=30)
 # history the compressor estimate needs to know the current state
 HISTORY_WINDOW = dt.timedelta(hours=6)  # > the longest min_run_min / max_pause_min
+# indoor trend: least-squares slope over this window, needs TREND_MIN_SPAN of data
+TREND_WINDOW = dt.timedelta(minutes=90)
+TREND_MIN_SPAN = dt.timedelta(minutes=45)
+TREND_MIN_POINTS = 5
 NEAR_K = THERMO_OFF_K - 1
 _TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 _SENSOR_RE = re.compile(r"^sensor\.[a-z0-9_]{1,120}$")
@@ -119,6 +129,8 @@ def validate_settings(body: Any) -> dict[str, Any]:
         raise ValueError("enabled must be true or false.")
     if not isinstance(body["night_off"], bool):
         raise ValueError("night_off must be true or false.")
+    if not isinstance(body["night_off_trend"], bool):
+        raise ValueError("night_off_trend must be true or false.")
     indoor = body["indoor_target"]
     if isinstance(indoor, bool) or not isinstance(indoor, (int, float)) or not 15 <= indoor <= 28:
         raise ValueError("indoor_target must be a number between 15 and 28.")
@@ -147,6 +159,8 @@ def validate_settings(body: Any) -> dict[str, Any]:
         "night_off_min_low": _float(body["night_off_min_low"], "night_off_min_low", -30, 15),
         "night_off_early_min": _int(body["night_off_early_min"], "night_off_early_min", 0, 180),
         "night_off_early_wait_min": _int(body["night_off_early_wait_min"], "night_off_early_wait_min", 0, 120),
+        "night_off_trend": body["night_off_trend"],
+        "night_off_trend_min": _int(body["night_off_trend_min"], "night_off_trend_min", 0, 360),
     }
 
 
@@ -217,6 +231,21 @@ class Observation:
     # during a defrost and its settle time: no tuning / power actions until then
     hold_until: dt.datetime | None = None
     compressor_since: dt.datetime | None = None  # start of the current compressor state (estimate)
+    indoor_trend: float | None = None  # K/h, see indoor_trend()
+
+
+def indoor_trend(points: list[tuple[dt.datetime, float]], now: dt.datetime) -> float | None:
+    """Least-squares slope (K/h) of the indoor readings within TREND_WINDOW before now."""
+    pts = [(t, v) for t, v in points if now - TREND_WINDOW <= t <= now]
+    if len(pts) < TREND_MIN_POINTS or pts[-1][0] - pts[0][0] < TREND_MIN_SPAN:
+        return None
+    xs = [(t - pts[0][0]).total_seconds() / 3600 for t, _ in pts]
+    ys = [v for _, v in pts]
+    mx, my = sum(xs) / len(xs), sum(ys) / len(ys)
+    var = sum((x - mx) ** 2 for x in xs)
+    if var == 0:
+        return None
+    return round(sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / var, 3)
 
 
 @dataclass
@@ -426,6 +455,7 @@ class Tuner:
         live.clear()
         live["checked_at"] = _iso(obs.now)
         live["indoor"] = obs.indoor
+        live["indoor_trend"] = obs.indoor_trend
         live["outdoor"] = obs.outdoor
         try:
             cmd = self._evaluate(entry, live, obs)
@@ -703,6 +733,15 @@ class Tuner:
         early = window is not None and not in_night and now >= window[0] - dt.timedelta(
             minutes=s["night_off_early_min"]
         )
+        # "prevent unnecessary last run": even earlier if the room stays warm enough until the night
+        trend_early = (
+            s["night_off_trend"]
+            and window is not None
+            and not in_night
+            and not early
+            and now >= window[0] - dt.timedelta(minutes=s["night_off_trend_min"])
+        )
+        early = early or trend_early
         key = _iso(window[0]) if window else None
         ok, why = night_off_conditions(s, fc)
         enabled = s["night_off"]
@@ -711,7 +750,7 @@ class Tuner:
             entry["state"].pop("early_off")
             self._log(entry, now, "early off", "Early off time over")
         if eo is not None:  # treated like a shutoff night from its start until its end
-            window, in_night, early = eo, True, False
+            window, in_night, early, trend_early = eo, True, False, False
             key, ok, why, enabled = f"early off {_iso(eo[0])}", True, _early_off_text(eo[1]), True
         if not obs.status_ok:
             live["note"] = "unit status unavailable"
@@ -806,6 +845,24 @@ class Tuner:
             live["note"] = "unit already off (not turned off by the dashboard)"
             return None
         prefix = why if eo else "night" if in_night else f"night from {window[0]:%H:%M}"
+        trend_text = ""
+        if trend_early:
+            plain_at = window[0] - dt.timedelta(minutes=s["night_off_early_min"])
+            later = f"shutoff from {plain_at:%H:%M}" if s["night_off_early_min"] else "shutoff at the start of the night"
+            if obs.indoor is None or obs.indoor_trend is None:
+                live["note"] = f"{prefix}: indoor trend unknown, {later}"
+                return None
+            hours = (window[0] - now).total_seconds() / 3600
+            projected = round(obs.indoor + min(obs.indoor_trend, 0.0) * hours, 1)
+            trend_text = (
+                f"indoor {_n(obs.indoor)} °C, trend {obs.indoor_trend:+.2f} K/h → {_n(projected)} °C at "
+                f"{window[0]:%H:%M}"
+            )
+            if projected < s["indoor_target"]:
+                live["note"] = f"{prefix}: {trend_text} < target {_n(s['indoor_target'])} °C, {later}"
+                return None
+            trend_text += f" ≥ target {_n(s['indoor_target'])} °C"
+            prefix = f"{prefix} ({trend_text})"
         wait_min = s["night_off_early_wait_min"]
         # never cut a run short: off only once the compressor has been off for the wait time
         if obs.compressor == "ON":
@@ -829,6 +886,11 @@ class Tuner:
         reason = f"night-time shutoff: {why}"
         if eo:
             reason = f"{why}, compressor off"
+        elif trend_early:
+            reason = (
+                f"early night-time shutoff (no unnecessary last run), night from {window[0]:%H:%M}, "
+                f"{trend_text}, compressor off: {why}"
+            )
         elif early:
             reason = f"early night-time shutoff, night from {window[0]:%H:%M} and compressor off: {why}"
         if not obs.control:
