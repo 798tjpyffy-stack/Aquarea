@@ -40,7 +40,8 @@ compressor does not start once more just before. With night_off_trend ("prevent
 an unnecessary last run") the same can happen up to night_off_trend_min before
 the night if the indoor temperature, projected with its falling trend (least
 squares over TREND_WINDOW; a rising trend counts as flat), is still at or above
-the indoor target at the start of the night.
+the indoor target at the start of the night. Only while the compressor is off,
+and only readings from TREND_SETTLE after its stop on count (heating skews them).
 
 Early off (manual, e.g. wood stove or sun): from now until a chosen time the
 same applies as during a shutoff night, without the forecast conditions and
@@ -100,6 +101,7 @@ HISTORY_WINDOW = dt.timedelta(hours=6)  # > the longest min_run_min / max_pause_
 TREND_WINDOW = dt.timedelta(minutes=90)
 TREND_MIN_SPAN = dt.timedelta(minutes=45)
 TREND_MIN_POINTS = 5
+TREND_SETTLE = dt.timedelta(minutes=30)  # only readings once the compressor has been off this long
 NEAR_K = THERMO_OFF_K - 1
 _TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 _SENSOR_RE = re.compile(r"^sensor\.[a-z0-9_]{1,120}$")
@@ -234,9 +236,15 @@ class Observation:
     indoor_trend: float | None = None  # K/h, see indoor_trend()
 
 
-def indoor_trend(points: list[tuple[dt.datetime, float]], now: dt.datetime) -> float | None:
-    """Least-squares slope (K/h) of the indoor readings within TREND_WINDOW before now."""
-    pts = [(t, v) for t, v in points if now - TREND_WINDOW <= t <= now]
+def indoor_trend(
+    points: list[tuple[dt.datetime, float]], now: dt.datetime, off_since: dt.datetime | None
+) -> float | None:
+    """Least-squares slope (K/h) of the indoor readings within TREND_WINDOW before now,
+    only from TREND_SETTLE after the compressor stopped (off_since; None = not known to be off)."""
+    if off_since is None:
+        return None
+    start = max(now - TREND_WINDOW, off_since + TREND_SETTLE)
+    pts = [(t, v) for t, v in points if start <= t <= now]
     if len(pts) < TREND_MIN_POINTS or pts[-1][0] - pts[0][0] < TREND_MIN_SPAN:
         return None
     xs = [(t - pts[0][0]).total_seconds() / 3600 for t, _ in pts]
@@ -849,8 +857,18 @@ class Tuner:
         if trend_early:
             plain_at = window[0] - dt.timedelta(minutes=s["night_off_early_min"])
             later = f"shutoff from {plain_at:%H:%M}" if s["night_off_early_min"] else "shutoff at the start of the night"
+            if obs.compressor != "OFF":
+                state = "running" if obs.compressor == "ON" else "state unknown"
+                live["note"] = f"{prefix}: compressor {state}, no indoor trend projection; {later}"
+                return None
             if obs.indoor is None or obs.indoor_trend is None:
-                live["note"] = f"{prefix}: indoor trend unknown, {later}"
+                ready_at = obs.compressor_since + TREND_SETTLE + TREND_MIN_SPAN if obs.compressor_since else None
+                ready = (
+                    f"indoor trend from {ready_at:%H:%M}"
+                    if ready_at is not None and ready_at > now and obs.indoor is not None
+                    else "not enough indoor readings for a trend"
+                )
+                live["note"] = f"{prefix}: {ready}, {later}"
                 return None
             hours = (window[0] - now).total_seconds() / 3600
             projected = round(obs.indoor + min(obs.indoor_trend, 0.0) * hours, 1)

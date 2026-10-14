@@ -221,8 +221,10 @@ def _observe(app: web.Application, report: dict[str, Any], dev: dict[str, Any]) 
     )
     indoor = sensor.get("value")
     column = f"{HA_PREFIX}{settings['indoor_sensor']}"
-    indoor_points = [
-        (dt.datetime.fromisoformat(r["timestamp"]), r[column]) for r in rows if _is_number(r.get(column))
+    indoor_points = [  # heating skews the trend: only readings while the compressor is off
+        (dt.datetime.fromisoformat(r["timestamp"]), r[column])
+        for r in rows
+        if _is_number(r.get(column)) and r.get("compressor") == "OFF"
     ]
     extra = dev.get("status_extra") or {}
     direction = (status.get("direction") or {}).get("name") if isinstance(status.get("direction"), dict) else None
@@ -231,6 +233,8 @@ def _observe(app: web.Application, report: dict[str, Any], dev: dict[str, Any]) 
     zones_on = any((z.get("operation_status") or {}).get("name") == "ON" for z in status.get("zones") or [])
     current = latest.get("timestamp") == report["generated_at"]  # history write may have failed
     comp_state = compressor.state_of(rows) if current else {}
+    comp_since = dt.datetime.fromisoformat(comp_state["since"]) if comp_state.get("since") else None
+    comp_now = latest.get("compressor") if current else None
     return tuning.Observation(
         now=now,
         control=app[ALLOW_CONTROL],
@@ -244,14 +248,14 @@ def _observe(app: web.Application, report: dict[str, Any], dev: dict[str, Any]) 
         indoor=indoor if isinstance(indoor, (int, float)) and not isinstance(indoor, bool) else None,
         outdoor=status.get("temperature_outdoor") if _is_number(status.get("temperature_outdoor")) else None,
         # only the row of this report counts (history write may have failed)
-        compressor=latest.get("compressor") if current else None,
-        compressor_since=dt.datetime.fromisoformat(comp_state["since"]) if comp_state.get("since") else None,
+        compressor=comp_now,
+        compressor_since=comp_since,
         heating=direction != "WATER" and extra.get("defrost") != 1,
         status_ok=bool(status),
         defrost=extra.get("defrost") == 1,
         quiet=_strict_int((status.get("quiet_mode") or {}).get("value")) if isinstance(status.get("quiet_mode"), dict) else None,
         hold_until=compressor.defrost_hold_until(rows, now, extra.get("defrost") == 1),
-        indoor_trend=tuning.indoor_trend(indoor_points, now),
+        indoor_trend=tuning.indoor_trend(indoor_points, now, comp_since if comp_now == "OFF" else None),
     )
 
 

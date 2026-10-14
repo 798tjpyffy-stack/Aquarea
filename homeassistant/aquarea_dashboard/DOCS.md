@@ -97,8 +97,10 @@ start once more for a short run just before the night.
 default): within this time before the night the unit can also be turned off
 (same compressor rule) if the indoor temperature, projected to the start of
 the night with its trend over the last 90 min, is still at or above the indoor
-target. A rising trend counts as flat. Without at least 45 min of indoor
-readings no projection is made.
+target. A rising trend counts as flat. This only applies while the compressor
+is off, and the trend only uses readings from 30 min after its stop (heating
+skews them); with less than 45 min of such readings no projection is made, so
+the earliest decision is 75 min after a stop.
 
 ### Early off
 

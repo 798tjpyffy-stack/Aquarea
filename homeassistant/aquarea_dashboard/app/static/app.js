@@ -863,7 +863,8 @@ function buildTuningView(deviceId) {
     field("Shutoff wait after compressor stop, min.", f.night_off_early_wait_min, "unit stays on this long after the last stop"),
     el("label", { class: "check" }, f.night_off_trend, el("span", { text: "Prevent unnecessary last run (indoor trend)" })),
     field("… up to min. before night", f.night_off_trend_min,
-      "off earlier if the room, projected with its falling trend, stays at or above the target until the night"));
+      "off earlier if the room, projected with its falling trend, stays at or above the target until the night; " +
+      "only while the compressor is off, trend from readings 30 min after its stop"));
   const buttons = el("div", { class: "control-row" }, save, discard);
   const status = el("div");
   const log = el("div");
@@ -886,7 +887,8 @@ function buildTuningView(deviceId) {
       "morning the shift goes back to normal. " +
       "Within the early shutoff time before the night this can already happen, avoiding a last short run. " +
       "With \u201cprevent unnecessary last run\u201d this can happen up to the set time before the night if the room, " +
-      "projected with its falling trend (last 90 min), is still at or above the indoor target at the start of the night. " +
+      "projected with its falling trend (last 90 min, only readings from 30 min after the compressor stopped; not " +
+      "while it runs), is still at or above the indoor target at the start of the night. " +
       "Early off (Operation tile) does the same from now until the end of the night or for a number of hours, " +
       "without the forecast conditions; no max. pause reset meanwhile." }),
     form, allowControl ? buttons : el("p", { class: "muted", text: "Read-only: start the server with --allow-control to change these settings." }),
