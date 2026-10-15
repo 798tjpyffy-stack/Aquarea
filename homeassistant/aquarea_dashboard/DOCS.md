@@ -102,6 +102,16 @@ is off, and the trend only uses readings from 30 min after its stop (heating
 skews them); with less than 45 min of such readings no projection is made, so
 the earliest decision is 75 min after a stop.
 
+**6am gate** (checkbox, on by default; time 06:00, threshold 21.0 °C): from
+the gate time until the end of the night, an indoor temperature below the
+threshold ends the shutoff night early: the unit is turned back on (shift back
+to normal) and stays on for the rest of that night. Before the unit has been
+turned off, it also prevents a shutoff from the gate time on. It applies to
+early off as well (from the first gate time after the early off started): the
+early off is ended, and an overlapping shutoff night with it. The gate time
+must lie within the night hours, otherwise it never applies to the shutoff
+night.
+
 ### Early off
 
 For when the pump is not needed, e.g. the wood stove is burning or the sun has

@@ -42,6 +42,10 @@ the night if the indoor temperature, projected with its falling trend (least
 squares over TREND_WINDOW; a rising trend counts as flat), is still at or above
 the indoor target at the start of the night. Only while the compressor is off,
 and only readings from TREND_SETTLE after its stop on count (heating skews them).
+6am gate (night_off_gate): from night_off_gate_time on, an indoor temperature
+below night_off_gate_temp ends the shutoff night or early off (the first gate time
+after its start) early: the unit is turned on and stays on for the rest of that
+night; an early off is ended.
 
 Early off (manual, e.g. wood stove or sun): from now until a chosen time the
 same applies as during a shutoff night, without the forecast conditions and
@@ -86,6 +90,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "night_off_early_wait_min": 30,  # min after the last compressor stop before turning off
     "night_off_trend": False,  # prevent an unnecessary last run (indoor trend)
     "night_off_trend_min": 180,  # min before the night: off if the room stays at/above target until then
+    "night_off_gate": True,  # 6am gate: end the shutoff night from the gate time if the room is colder than
+    "night_off_gate_temp": 21.0,  # °C
+    "night_off_gate_time": "06:00",
 }
 LOG_LIMIT = 200
 PUBLIC_LOG = 20
@@ -133,13 +140,15 @@ def validate_settings(body: Any) -> dict[str, Any]:
         raise ValueError("night_off must be true or false.")
     if not isinstance(body["night_off_trend"], bool):
         raise ValueError("night_off_trend must be true or false.")
+    if not isinstance(body["night_off_gate"], bool):
+        raise ValueError("night_off_gate must be true or false.")
     indoor = body["indoor_target"]
     if isinstance(indoor, bool) or not isinstance(indoor, (int, float)) or not 15 <= indoor <= 28:
         raise ValueError("indoor_target must be a number between 15 and 28.")
     min_outdoor = body["min_outdoor"]
     if isinstance(min_outdoor, bool) or not isinstance(min_outdoor, (int, float)) or not -25 <= min_outdoor <= 20:
         raise ValueError("min_outdoor must be a number between -25 and 20.")
-    for key in ("night_start", "night_end"):
+    for key in ("night_start", "night_end", "night_off_gate_time"):
         if not isinstance(body[key], str) or not _TIME_RE.match(body[key]):
             raise ValueError(f"{key} must be a time HH:MM.")
     if not isinstance(body["indoor_sensor"], str) or not _SENSOR_RE.match(body["indoor_sensor"]):
@@ -163,6 +172,9 @@ def validate_settings(body: Any) -> dict[str, Any]:
         "night_off_early_wait_min": _int(body["night_off_early_wait_min"], "night_off_early_wait_min", 0, 120),
         "night_off_trend": body["night_off_trend"],
         "night_off_trend_min": _int(body["night_off_trend_min"], "night_off_trend_min", 0, 360),
+        "night_off_gate": body["night_off_gate"],
+        "night_off_gate_temp": _float(body["night_off_gate_temp"], "night_off_gate_temp", 10, 28),
+        "night_off_gate_time": body["night_off_gate_time"],
     }
 
 
@@ -753,6 +765,7 @@ class Tuner:
         key = _iso(window[0]) if window else None
         ok, why = night_off_conditions(s, fc)
         enabled = s["night_off"]
+        regular_key, regular_in_night = key, in_night
         eo = _early_off(entry["state"], now)
         if eo is None and "early_off" in entry["state"]:
             entry["state"].pop("early_off")
@@ -770,6 +783,18 @@ class Tuner:
             # overlapping early off / shutoff night: the unit stays off
             self._log(entry, now, "power", f"Unit stays off: {why}")
             no["night"] = key
+        # 6am gate: from the first gate time after the start of the shutoff night / early off on,
+        # a room below the threshold ends it
+        gate = None
+        if s["night_off_gate"] and in_night and obs.indoor is not None:
+            gt = s["night_off_gate_time"]
+            gate_time = dt.time(int(gt[:2]), int(gt[3:]))
+            start_day = window[0].astimezone().date()
+            gate_at = dt.datetime.combine(start_day, gate_time).astimezone()
+            if gate_at <= window[0]:
+                gate_at = dt.datetime.combine(start_day + dt.timedelta(days=1), gate_time).astimezone()
+            if now >= gate_at and obs.indoor < s["night_off_gate_temp"]:
+                gate = f"6am gate ({gt}): indoor {_n(obs.indoor)} °C < {_n(s['night_off_gate_temp'])} °C"
         if no.get("active"):
             if not (in_night or early) or no.get("night") != key:
                 end_reason = "early off over" if str(no.get("night")).startswith("early off") else "night over"
@@ -782,6 +807,13 @@ class Tuner:
                 and fc["night_min"] < s["night_off_min_low"]
             ):
                 end_reason = f"forecast night minimum {_n(fc['night_min'])} °C < {_n(s['night_off_min_low'])} °C"
+            elif gate is not None or no.get("gate"):
+                end_reason = no["gate"] = no.get("gate") or gate  # kept even if the room warms meanwhile
+                if eo is not None:  # end the early off; within a shutoff night it ends that as well
+                    entry["state"].pop("early_off", None)
+                    self._log(entry, now, "early off", f"Early off ended: {end_reason}")
+                    if regular_in_night:
+                        no["night"] = regular_key
             else:
                 end_reason = None
             if obs.unit_on:
@@ -845,6 +877,12 @@ class Tuner:
             return None
         if no.get("done"):
             live["note"] = "no more shutoff during this early off" if eo else "no more shutoff this night"
+            return None
+        if gate is not None:
+            if eo is not None:
+                entry["state"].pop("early_off", None)
+                self._log(entry, now, "early off", f"Early off ended: {gate}")
+            live["note"] = f"stays on ({gate})"
             return None
         if not ok:
             live["note"] = f"stays on ({why})"

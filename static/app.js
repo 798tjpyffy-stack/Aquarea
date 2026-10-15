@@ -839,6 +839,9 @@ function buildTuningView(deviceId) {
     night_off_early_wait_min: numberInput("0", "120", "5"),
     night_off_trend: el("input", { type: "checkbox" }),
     night_off_trend_min: numberInput("0", "360", "15"),
+    night_off_gate: el("input", { type: "checkbox" }),
+    night_off_gate_temp: numberInput("10", "28", "0.1"),
+    night_off_gate_time: el("input", { type: "time" }),
   };
   const field = (label, input, hint) =>
     el("label", {}, el("span", { text: label }), input, hint ? el("small", { class: "muted", text: hint }) : null);
@@ -864,7 +867,10 @@ function buildTuningView(deviceId) {
     el("label", { class: "check" }, f.night_off_trend, el("span", { text: "Prevent unnecessary last run (indoor trend)" })),
     field("… up to min. before night", f.night_off_trend_min,
       "off earlier if the room, projected with its falling trend, stays at or above the target until the night; " +
-      "only while the compressor is off, trend from readings 30 min after its stop"));
+      "only while the compressor is off, trend from readings 30 min after its stop"),
+    el("label", { class: "check" }, f.night_off_gate, el("span", { text: "6am gate: end the shutoff night or early off if the room is too cold" })),
+    field("6am gate: from", f.night_off_gate_time, "must lie within the night (or early off)"),
+    field("6am gate: on again below indoor °C", f.night_off_gate_temp, "unit is turned on and stays on for the rest of the night"));
   const buttons = el("div", { class: "control-row" }, save, discard);
   const status = el("div");
   const log = el("div");
@@ -889,6 +895,8 @@ function buildTuningView(deviceId) {
       "With \u201cprevent unnecessary last run\u201d this can happen up to the set time before the night if the room, " +
       "projected with its falling trend (last 90 min, only readings from 30 min after the compressor stopped; not " +
       "while it runs), is still at or above the indoor target at the start of the night. " +
+      "With the 6am gate, from the gate time a room below its threshold ends the shutoff night or early off " +
+      "(unit on until the next night). " +
       "Early off (Operation tile) does the same from now until the end of the night or for a number of hours, " +
       "without the forecast conditions; no max. pause reset meanwhile." }),
     form, allowControl ? buttons : el("p", { class: "muted", text: "Read-only: start the server with --allow-control to change these settings." }),
@@ -916,8 +924,10 @@ function buildTuningView(deviceId) {
     f.enabled.checked = s.enabled;
     f.night_off.checked = s.night_off;
     f.night_off_trend.checked = s.night_off_trend;
+    f.night_off_gate.checked = s.night_off_gate;
     for (const k of ["normal_shift", "up_max", "down_max", "min_run_min", "max_pause_min", "indoor_target", "min_outdoor", "night_start", "night_end",
-      "night_off_min_mean", "night_off_min_low", "night_off_early_min", "night_off_early_wait_min", "night_off_trend_min"]) f[k].value = String(s[k]);
+      "night_off_min_mean", "night_off_min_low", "night_off_early_min", "night_off_early_wait_min", "night_off_trend_min", "night_off_gate_temp",
+      "night_off_gate_time"]) f[k].value = String(s[k]);
     fillSensors(s.indoor_sensor);
     f.indoor_sensor.value = s.indoor_sensor;
     dirty = false;
@@ -977,6 +987,9 @@ function buildTuningView(deviceId) {
       night_off_early_wait_min: Number(f.night_off_early_wait_min.value),
       night_off_trend: f.night_off_trend.checked,
       night_off_trend_min: Number(f.night_off_trend_min.value),
+      night_off_gate: f.night_off_gate.checked,
+      night_off_gate_temp: Number(f.night_off_gate_temp.value),
+      night_off_gate_time: f.night_off_gate_time.value,
     };
     if (body.night_off && !settings?.night_off &&
         !confirm("Enable night-time shutoff? The dashboard will turn the whole unit off during the night hours.")) return;
