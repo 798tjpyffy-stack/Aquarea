@@ -31,7 +31,9 @@ while a step was still possible (shift below normal + up_max) is logged.
 
 Safety: commands only with --allow-control, heating on and the zone in curve
 mode; at most one +1 step per MIN_STEP and only after the unit reports the
-previous value; at most MAX_COMMANDS_PER_HOUR commands; a shift changed
+previous value; at most MAX_COMMANDS_PER_HOUR commands per hour and
+MAX_COMMANDS_PER_DAY per 24 h (the unit likely stores settings in EEPROM,
+whose write endurance is unknown); a shift changed
 elsewhere (app, unit, this dashboard's manual control) pauses tuning. During a
 defrost and compressor.DEFROST_SETTLE_MS after it (Observation.hold_until) no
 shift or power command is sent; compressor edges are acted on afterwards.
@@ -141,6 +143,7 @@ PUBLIC_LOG = 20
 MIN_STEP = dt.timedelta(minutes=5)
 CONFIRM_TIMEOUT = dt.timedelta(minutes=20)
 MAX_COMMANDS_PER_HOUR = 6
+MAX_COMMANDS_PER_DAY = 48
 POWER_RETRY = dt.timedelta(minutes=10)  # between power commands
 MAX_OFF_ATTEMPTS = 3
 MIN_EVAL_INTERVAL = dt.timedelta(seconds=30)
@@ -387,6 +390,9 @@ def _parse(value: Any) -> dt.datetime | None:
         return None
 
 
+_sent_within = quiet.sent_within
+
+
 def _n(v: float | None) -> str:
     return "–" if v is None else (str(int(v)) if float(v).is_integer() else str(v))
 
@@ -559,6 +565,12 @@ class Tuner:
             "live": self._live.get(device_id, {}),
             "log": entry["log"][-PUBLIC_LOG:],
             "near_k": NEAR_K,
+            "commands": {
+                "hour": len(_sent_within(st, dt.datetime.now().astimezone(), dt.timedelta(hours=1))),
+                "day": len(_sent_within(st, dt.datetime.now().astimezone(), dt.timedelta(days=1))),
+                "max_hour": MAX_COMMANDS_PER_HOUR,
+                "max_day": MAX_COMMANDS_PER_DAY,
+            },
             "night_off": {
                 **self._night_live.get(device_id, {}),
                 "active": bool((st.get("night_off") or {}).get("active")),
@@ -856,10 +868,16 @@ class Tuner:
         cmd.value = max(lo, min(hi, cmd.value))
         if cmd.value == obs.shift or (cmd.value == commanded and not st.get("confirmed")):
             return None
-        recent = [t for t in st.get("commands") or [] if (p := _parse(t)) and now - p < dt.timedelta(hours=1)]
+        recent = _sent_within(st, now, dt.timedelta(hours=1))
+        daily = _sent_within(st, now, dt.timedelta(days=1))
+        limit = None
         if len(recent) >= MAX_COMMANDS_PER_HOUR:
-            live["note"] = f"{why} · command limit reached ({MAX_COMMANDS_PER_HOUR}/h), skipped: {cmd.reason}"
-            text = f"Limit {MAX_COMMANDS_PER_HOUR}/h: {cmd.reason}"
+            limit = f"{MAX_COMMANDS_PER_HOUR}/h"
+        elif len(daily) >= MAX_COMMANDS_PER_DAY:
+            limit = f"{MAX_COMMANDS_PER_DAY}/24 h, next at {_parse(daily[0]) + dt.timedelta(days=1):%H:%M}"
+        if limit:
+            live["note"] = f"{why} · command limit reached ({limit}), skipped: {cmd.reason}"
+            text = f"Limit {limit.split(',')[0]}: {cmd.reason}"
             if not entry["log"] or entry["log"][-1].get("text") != text:
                 self._log(entry, now, "skipped", text, to=cmd.value)
             return None
@@ -900,9 +918,7 @@ class Tuner:
         """Result of sending a command from evaluate()."""
         entry = self.entry(device_id)
         st = entry["state"]
-        st["commands"] = [
-            t for t in st.get("commands") or [] if (p := _parse(t)) and now - p < dt.timedelta(hours=1)
-        ] + [_iso(now)]
+        st["commands"] = _sent_within(st, now, dt.timedelta(days=1)) + [_iso(now)]
         if error:
             self._log(entry, now, "error", f"Sending shift {cmd.value} failed: {error}", to=cmd.value)
         else:
@@ -925,6 +941,12 @@ class Tuner:
             "settings": q["settings"],
             "state": {k: st.get(k) for k in ("paused", "commanded", "confirmed", "defrost_lock", "adv_level")},
             "live": self._quiet_live.get(device_id, {}),
+            "commands": {
+                "hour": len(quiet.sent_within(st, dt.datetime.now().astimezone(), dt.timedelta(hours=1))),
+                "day": len(quiet.sent_within(st, dt.datetime.now().astimezone(), dt.timedelta(days=1))),
+                "max_hour": quiet.MAX_COMMANDS_PER_HOUR,
+                "max_day": quiet.MAX_COMMANDS_PER_DAY,
+            },
         }
 
     def update_quiet(self, device_id: str, settings: dict[str, Any], now: dt.datetime) -> None:

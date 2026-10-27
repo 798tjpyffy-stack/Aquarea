@@ -27,6 +27,7 @@ DEFAULT_QUIET: dict[str, Any] = {
 QUIET_LEVELS = (0, 1, 2, 3)
 CONFIRM_TIMEOUT = dt.timedelta(minutes=20)
 MAX_COMMANDS_PER_HOUR = 10
+MAX_COMMANDS_PER_DAY = 24  # the unit likely stores settings in EEPROM
 
 
 @dataclass
@@ -71,6 +72,11 @@ def _parse(value: Any) -> dt.datetime | None:
         return dt.datetime.fromisoformat(value)
     except (TypeError, ValueError):
         return None
+
+
+def sent_within(st: dict[str, Any], now: dt.datetime, span: dt.timedelta) -> list[str]:
+    """Send times in st["commands"] within span before now (oldest first)."""
+    return [t for t in st.get("commands") or [] if (p := _parse(t)) and now - p < span]
 
 
 def _n(v: float | None) -> str:
@@ -173,18 +179,21 @@ def decide(q: dict[str, Any], live: dict[str, Any], obs: Any, log: Log) -> Quiet
     if not obs.control:
         live["note"] += " · control disabled (--allow-control)"
         return None
-    recent = [t for t in st.get("commands") or [] if (p := _parse(t)) and now - p < dt.timedelta(hours=1)]
+    recent = sent_within(st, now, dt.timedelta(hours=1))
+    daily = sent_within(st, now, dt.timedelta(days=1))
     if len(recent) >= MAX_COMMANDS_PER_HOUR:
         live["note"] += f" · command limit reached ({MAX_COMMANDS_PER_HOUR}/h)"
+        return None
+    if len(daily) >= MAX_COMMANDS_PER_DAY:
+        nxt = _parse(daily[0]) + dt.timedelta(days=1)
+        live["note"] += f" · command limit reached ({MAX_COMMANDS_PER_DAY}/24 h, next at {nxt:%H:%M})"
         return None
     return QuietCommand(want, obs.quiet, why)
 
 
 def record(q: dict[str, Any], cmd: QuietCommand, now: dt.datetime, error: str | None, log: Log) -> None:
     st = q["state"]
-    st["commands"] = [
-        t for t in st.get("commands") or [] if (p := _parse(t)) and now - p < dt.timedelta(hours=1)
-    ] + [_iso(now)]
+    st["commands"] = sent_within(st, now, dt.timedelta(days=1)) + [_iso(now)]
     if error:
         log("error", f"Setting quiet mode {cmd.level} failed: {error}")
         return

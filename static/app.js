@@ -383,7 +383,10 @@ function buildQuietAutoView(deviceId) {
     const text = q.settings.enabled
       ? `Auto: ${live.note ?? "on, applied at the next update (within a minute)"}`
       : st.paused ? `Auto paused: ${st.paused}` : "Auto: off";
-    status.textContent = text;
+    const c = q.commands;
+    status.textContent = c
+      ? `${text} · commands ${c.hour}/${c.max_hour} last hour, ${c.day}/${c.max_day} last 24 h`
+      : text;
   }
 
   save.addEventListener("click", async () => {
@@ -1014,6 +1017,9 @@ function buildTuningView(deviceId) {
       ["Mode", live.mode ? `${live.mode}${live.note ? ` \u2013 ${live.note}` : ""}` : "–"],
       ["Shift", `${sign(shift)}${t.settings.enabled && typeof st.commanded === "number"
         ? ` \u00b7 commanded ${sign(st.commanded)}${st.confirmed ? "" : " (waiting for the unit)"}` : ""}`],
+      ["Shift commands", t.commands
+        ? `${t.commands.hour}/${t.commands.max_hour} last hour \u00b7 ${t.commands.day}/${t.commands.max_day} last 24 h`
+        : "–"],
       ["Indoor", typeof live.indoor === "number" ? `${live.indoor} °C (target ${t.settings.indoor_target} °C)` : "–"],
       ["Outdoor", typeof live.outdoor === "number" ? `${live.outdoor} °C (min. ${t.settings.min_outdoor} °C)` : "–"],
       ["Room cooling (learned)", coolingText(t.cooling)],
