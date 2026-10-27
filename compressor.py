@@ -165,8 +165,13 @@ def estimate(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
         pw = power_at(t)
         # a 15-min average that started before (or just after, as the kWh total
-        # lags) a water-detected change mixes both states
-        pw_ok = pw is not None and (trend_at is None or pw.start >= trend_at + POWER_LAG_MS)
+        # lags) a water-detected change or a power-on mixes both states (after
+        # power-on the pump circulates first; the water uptick shows the start)
+        pw_ok = (
+            pw is not None
+            and (trend_at is None or pw.start >= trend_at + POWER_LAG_MS)
+            and (on_at is None or pw.start >= on_at + POWER_LAG_MS)
+        )
         since_on = _minutes(t - on_at) if on_at is not None and t - on_at < STARTUP_MS else None
         nxt, why, by_trend = state, ("unchanged" if state else None), False
         defrost = _defrost(p)

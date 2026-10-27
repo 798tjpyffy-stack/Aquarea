@@ -17,8 +17,8 @@ from typing import Any, Callable
 import aiohttp
 
 from aioaquarea import ApiError, AquareaEnvironment, AuthenticationError, Client
-from aioaquarea.auth import PanasonicRequestHeader
-from aioaquarea.const import APP_CLIENT_ID, AUTH_0_CLIENT, AUTH_API_USER_AGENT, BASE_PATH_AUTH
+from aioaquarea.auth import PanasonicRequestHeader, PanasonicSettings
+from aioaquarea.const import APP_CLIENT_ID, AUTH_0_CLIENT, AUTH_API_USER_AGENT, BASE_PATH_ACC, BASE_PATH_AUTH
 from aioaquarea.errors import AuthenticationErrorCodes
 
 _LOGGER = logging.getLogger("aquarea_token")
@@ -33,6 +33,53 @@ _VOLATILE_HEADERS = (
     "x-user-authorization-v2",
     "x-client-id",
 )
+NEW_VERSION_CODE = 4106  # "New version app has been published"
+# Last app version Panasonic accepted (shared by all clients of this process)
+_accepted_version: str | None = None
+
+
+def _version_candidates(found: str) -> list[str]:
+    """Versions to try, nearest first: the scraped one is the iOS release, but
+    Panasonic only accepts exact (Android) versions, which can differ."""
+    try:
+        major, minor, patch = (int(p) for p in found.split("."))
+    except ValueError:
+        return [found]
+    out = [found]
+    out += [f"{major}.{minor}.{p}" for p in range(patch + 1, patch + 4)]
+    out += [f"{major}.{minor}.{p}" for p in range(patch - 1, -1, -1)]
+    if minor > 0:
+        out += [f"{major}.{minor - 1}.{p}" for p in range(9, -1, -1)]
+    return out
+
+
+async def _version_accepted(http: aiohttp.ClientSession, version: str) -> bool | None:
+    """Ask Panasonic whether it accepts this app version.
+
+    Uses a dummy token: the version check comes before the token check, so no
+    credentials are sent. None = no answer.
+    """
+    settings = PanasonicSettings()
+    settings.access_token = "version-check"
+
+    class _Fixed:
+        async def get(self) -> str:
+            return version
+
+    headers = await PanasonicRequestHeader.get(settings, _Fixed(), include_client_id=False)  # type: ignore[arg-type]
+    try:
+        async with http.post(
+            f"{BASE_PATH_ACC}/auth/v2/login",
+            headers=headers,
+            json={"language": 0},
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as resp:
+            body = await resp.json(content_type=None)
+    except (aiohttp.ClientError, TimeoutError, ValueError):
+        return None
+    if not isinstance(body, dict) or "code" not in body:
+        return None
+    return body.get("code") != NEW_VERSION_CODE
 
 
 class PersistentClient(Client):
@@ -49,7 +96,28 @@ class PersistentClient(Client):
         self._has_password = password is not None
         self._app_version_ready = False
         self.on_token: Callable[[], None] | None = None
+        self._scrape_app_version = self._app_version.refresh
+        self._app_version.refresh = self._refresh_app_version  # type: ignore[method-assign]
         self._wrap_requests()
+
+    async def _refresh_app_version(self) -> None:
+        """App Store version, corrected to one Panasonic actually accepts."""
+        global _accepted_version
+        await self._scrape_app_version()
+        found = self._app_version.version
+        tried: list[str] = []
+        for version in dict.fromkeys(([_accepted_version] if _accepted_version else []) + _version_candidates(found)):
+            ok = await _version_accepted(self._sess, version)
+            if ok is None:
+                _LOGGER.warning("App version check failed, using %s", self._app_version.version)
+                return
+            if ok:
+                if version != found:
+                    _LOGGER.warning("App Store shows %s, Panasonic accepts %s", found, version)
+                _accepted_version = self._app_version.version = version
+                return
+            tried.append(version)
+        _LOGGER.error("Panasonic accepts none of the app versions %s", ", ".join(tried))
 
     def _wrap_requests(self) -> None:
         """Retry each API request once after renewing the token / app version.
@@ -177,7 +245,8 @@ class PersistentClient(Client):
         ) as resp:
             if resp.status != 200:
                 raise AuthenticationError(
-                    AuthenticationErrorCodes.API_ERROR, f"Token refresh: HTTP {resp.status}"
+                    AuthenticationErrorCodes.API_ERROR,
+                    f"Token refresh: HTTP {resp.status}{await _auth_error_text(resp)}",
                 )
             data = await resp.json(content_type=None)
         self._settings.set_token(
@@ -186,6 +255,11 @@ class PersistentClient(Client):
             received + data["expires_in"],
             data.get("scope") or self._settings.scope,
         )
+        # Save at once: if the refresh token was rotated, the stored one is now
+        # invalid, and the next step may fail before login() saves.
+        self._apply_token()
+        if self.on_token:
+            self.on_token()
         # Same as a fresh login: register the new token and get the ACC clientId.
         await self._authenticator._retrieve_client_acc()  # noqa: SLF001
 
@@ -194,6 +268,18 @@ class PersistentClient(Client):
         self._apply_token()
         if self.on_token:
             self.on_token()
+
+
+async def _auth_error_text(resp: aiohttp.ClientResponse) -> str:
+    """OAuth error fields of a failed response (never the whole body)."""
+    try:
+        body = await resp.json(content_type=None)
+    except (aiohttp.ClientError, ValueError):
+        return ""
+    if not isinstance(body, dict):
+        return ""
+    parts = [str(body[k])[:200] for k in ("error", "error_description") if body.get(k)]
+    return f" ({': '.join(parts)})" if parts else ""
 
 
 class TokenStore:

@@ -4,6 +4,8 @@ const $ = (id) => document.getElementById(id);
 let lastReport = null;
 let allowControl = false;
 let pollMinutes = 10;
+let offPollMinutes = 10;
+let historyGapMinutes = 30;
 let autoTimer = null;
 let historyHours = 24;
 let currentUser = null;
@@ -64,6 +66,18 @@ function kvTable(obj) {
 function section(title, content, open = false) {
   const details = el("details", { class: "card" }, el("summary", { text: title }), content);
   if (open) details.open = true;
+  return details;
+}
+
+// Long explanation, collapsed by default; the open state survives re-renders.
+const explainOpen = new Set();
+function explain(key, text, title = "How it works") {
+  const details = el("details", { class: "explain" }, el("summary", { text: title }), el("p", { class: "muted", text }));
+  details.open = explainOpen.has(key);
+  details.addEventListener("toggle", () => {
+    if (details.open) explainOpen.add(key);
+    else explainOpen.delete(key);
+  });
   return details;
 }
 
@@ -259,7 +273,9 @@ function buildEarlyOffView(deviceId) {
     update(t) {
       const eo = t.early_off;
       morningText.textContent = `Until the end of the night (${t.settings.night_end})`;
-      status.textContent = eo ? `Early off until ${untilText(eo.until)}: ${t.night_off?.note ?? "–"}` : "";
+      status.textContent = eo
+        ? `${eo.auto ? `Auto early off until the room is below ${t.settings.indoor_target} °C` : `Early off until ${untilText(eo.until)}`}: ${t.night_off?.note ?? "–"}`
+        : "";
       status.hidden = !eo;
       details.hidden = Boolean(eo);
       stopRow.hidden = !eo;
@@ -780,7 +796,7 @@ function historyChart(rows) {
   let onMs = 0, knownMs = 0;
   pts.forEach((p, i) => {
     const next = pts[i + 1];
-    if (!next || !p.compressor || next.t - p.t > 3 * pollMinutes * 60_000) return;
+    if (!next || !p.compressor || next.t - p.t > historyGapMinutes * 60_000) return;
     knownMs += next.t - p.t;
     if (p.compressor === "ON") onMs += next.t - p.t;
   });
@@ -788,7 +804,7 @@ function historyChart(rows) {
 
   return el("div", {}, legend, root, readout,
     el("p", { class: "muted", text: `${pts.length} data point(s) · stored in the history CSV${runtime}` }),
-    el("p", { class: "muted", text: `* Compressor estimated: OFF when operation is off, ON in defrost. Panasonic thermostat: OFF when Zone 1 water ≥ target + ${THERMO_OFF_K} K for ${THERMO_MS / 60_000} min (highest target of the last ${TARGET_UPDATE_MS / 60_000} min, since the unit's update time is unknown). Zone 1 water rising ${WATER_STEP_K} K above its low since the last change (e.g. the uptick after the pump-start dip) = ON, falling ${WATER_STEP_K} K below its high = OFF. Otherwise 15-min avg power ≥ ${COMPRESSOR_ON_KW * 1000} W = ON, ≤ ${COMPRESSOR_OFF_KW * 1000} W = OFF (ignored for ${POWER_LAG_MIN} min after a water-detected change, as the kWh total lags). Th.off: light = water within 1 K of target + ${THERMO_OFF_K} K (lowest possible target), dark = at/above it for the highest possible target (3-min timer running).` }));
+    explain("compressor", `* Compressor estimated: OFF when operation is off, ON in defrost. Panasonic thermostat: OFF when Zone 1 water ≥ target + ${THERMO_OFF_K} K for ${THERMO_MS / 60_000} min (highest target of the last ${TARGET_UPDATE_MS / 60_000} min, since the unit's update time is unknown). Zone 1 water rising ${WATER_STEP_K} K above its low since the last change (e.g. the uptick after the pump-start dip) = ON, falling ${WATER_STEP_K} K below its high = OFF. Otherwise 15-min avg power ≥ ${COMPRESSOR_ON_KW * 1000} W = ON, ≤ ${COMPRESSOR_OFF_KW * 1000} W = OFF (ignored for ${POWER_LAG_MIN} min after a water-detected change, as the kWh total lags). Th.off: light = water within 1 K of target + ${THERMO_OFF_K} K (lowest possible target), dark = at/above it for the highest possible target (3-min timer running).`, "* Compressor estimate"));
 }
 
 // ------------------------------------------------------------------ tuning
@@ -826,6 +842,7 @@ function buildTuningView(deviceId) {
     up_max: numberInput("0", "5"),
     down_max: numberInput("0", "5"),
     min_run_min: numberInput("0", "240", "10"),
+    up_wait_pct: numberInput("0", "100", "5"),
     max_pause_min: numberInput("0", "300", "10"),
     indoor_target: numberInput("15", "28", "0.1"),
     min_outdoor: numberInput("-25", "20", "0.5"),
@@ -839,8 +856,15 @@ function buildTuningView(deviceId) {
     night_off_early_wait_min: numberInput("0", "120", "5"),
     night_off_trend: el("input", { type: "checkbox" }),
     night_off_trend_min: numberInput("0", "360", "15"),
+    night_off_extend: el("input", { type: "checkbox" }),
+    night_off_dynamic: el("input", { type: "checkbox" }),
+    night_off_dynamic_from: el("input", { type: "time" }),
+    night_off_dynamic_until: el("input", { type: "time" }),
+    night_off_dynamic_margin: numberInput("0", "2", "0.1"),
     night_off_gate: el("input", { type: "checkbox" }),
     night_off_gate_temp: numberInput("10", "28", "0.1"),
+    early_off_auto: el("input", { type: "checkbox" }),
+    early_off_auto_temp: numberInput("15", "30", "0.1"),
     night_off_gate_time: el("input", { type: "time" }),
   };
   const field = (label, input, hint) =>
@@ -853,6 +877,8 @@ function buildTuningView(deviceId) {
     field("Max. shift up", f.up_max, "steps above normal while heat is needed"),
     field("Shift down", f.down_max, "below normal after a stop (night / warm)"),
     field("Min. compressor run, min.", f.min_run_min, "shift up (within max.) until a run lasts this long; 0 = off"),
+    field("Up step wait, % of last degree", f.up_wait_pct,
+      "a +1 step waits this share of the time the water took for its last degree; 0 = at once; at target + 3 K always at once"),
     field("Max. compressor pause, min.", f.max_pause_min, "then, if the room is at or below target, a shift below normal goes back to normal; 0 = off"),
     field("Indoor target °C", f.indoor_target, "warmer = down mode"),
     field("Min. outdoor °C", f.min_outdoor, "colder = no tuning, normal shift"),
@@ -864,24 +890,36 @@ function buildTuningView(deviceId) {
     field("No shutoff if night min. below °C", f.night_off_min_low, "forecast lowest temperature of the night"),
     field("Early shutoff, min. before night", f.night_off_early_min, "only while the compressor is off; 0 = never"),
     field("Shutoff wait after compressor stop, min.", f.night_off_early_wait_min, "unit stays on this long after the last stop"),
-    el("label", { class: "check" }, f.night_off_trend, el("span", { text: "Prevent unnecessary last run (indoor trend)" })),
+    el("label", { class: "check" }, f.night_off_trend, el("span", { text: "Prevent unnecessary last run (learned cooling model)" })),
     field("… up to min. before night", f.night_off_trend_min,
-      "off earlier if the room, projected with its falling trend, stays at or above the target until the night; " +
-      "only while the compressor is off, trend from readings 30 min after its stop"),
+      "off earlier if the room, projected with the learned cooling model and the outdoor forecast, " +
+      "stays at or above the target until the night; only while the compressor is off"),
+    el("label", { class: "check" }, f.night_off_dynamic, el("span", { text: "Dynamic night start (learned cooling model; replaces early shutoff and last-run prevention)" })),
+    field("Dynamic start: earliest", f.night_off_dynamic_from, "at or before “night from”"),
+    field("Dynamic start: latest", f.night_off_dynamic_until, "at or after “night from”; not reached = no shutoff that night"),
+    field("Dynamic start: margin K", f.night_off_dynamic_margin,
+      "off once the room is projected at or above the 6am gate temperature + margin at the end of the night"),
+    el("label", { class: "check" }, f.night_off_extend, el("span", { text: "Stay off after the night while the room is at or above the target" })),
     el("label", { class: "check" }, f.night_off_gate, el("span", { text: "6am gate: end the shutoff night or early off if the room is too cold" })),
     field("6am gate: from", f.night_off_gate_time, "must lie within the night (or early off)"),
-    field("6am gate: on again below indoor °C", f.night_off_gate_temp, "unit is turned on and stays on for the rest of the night"));
+    field("6am gate: on again below indoor °C", f.night_off_gate_temp, "unit is turned on and stays on for the rest of the night"),
+    el("label", { class: "check" }, f.early_off_auto, el("span", { text: "Auto early off when the room is too warm" })),
+    field("Auto early off above indoor °C", f.early_off_auto_temp,
+      "starts an early off; it ends when the room is below the indoor target"));
   const buttons = el("div", { class: "control-row" }, save, discard);
   const status = el("div");
   const log = el("div");
   const details = section("Hysteresis tuning (curve shift)", el("div", {},
-    el("p", { class: "muted", text:
+    explain("tuning",
       "Lengthens compressor runs: while it runs and the room needs heat, the shift goes up by 1 when the water is " +
       "within 1 K of the thermo off point (target + 3 K), up to normal + max. When the compressor stops, the shift " +
-      "goes back to normal, or down by \u201cshift down\u201d at night or when the room is warmer than the indoor target " +
+      "goes back to normal, or down by \u201cshift down\u201d in the night hours while a shutoff is planned or running " +
+      "(otherwise the room decides, e.g. after the 6am gate) or when the room is warmer than the indoor target " +
       "(also later while it is off, as soon as that applies); " +
       "when it starts again (or runs with the shift below normal), back to normal. Until a run reaches the minimum run time the shift also goes up in " +
       "down mode (never above normal + max); after that it goes back to normal and the compressor stops on its own. " +
+      "A +1 step waits the set share of the time the water took to heat up its last degree, counted from reaching " +
+      "the current degree (avoids spikes in the unit's power calculation). " +
       "If the compressor stays off longer than the maximum pause with the shift lowered and the room is not " +
       "warmer than the indoor target, the shift goes back to normal so it restarts on its own (no shift down again " +
       "until it has run). " +
@@ -893,12 +931,29 @@ function buildTuningView(deviceId) {
       "morning the shift goes back to normal. " +
       "Within the early shutoff time before the night this can already happen, avoiding a last short run. " +
       "With \u201cprevent unnecessary last run\u201d this can happen up to the set time before the night if the room, " +
-      "projected with its falling trend (last 90 min, only readings from 30 min after the compressor stopped; not " +
-      "while it runs), is still at or above the indoor target at the start of the night. " +
+      "projected with the room cooling model learned from the history (heat loss proportional to indoor minus " +
+      "outdoor temperature, outdoor from the forecast; extra heat from people until 22:00, given back over the " +
+      "following hours; fitted daily from 2 h samples from 17:00 to 08:00, starting 30 min after a compressor " +
+      "stop), is still at or above the indoor target at the start of the night " +
+      "(only while the compressor is off). " +
+      "With \u201cstay off after the night\u201d the unit stays off at the end of a shutoff night until the room is " +
+      "below the indoor target; if the cooling model shows it stays warm until the next night, the next " +
+      "shutoff takes over within the early shutoff time (or, with \u201cprevent unnecessary last run\u201d, within its " +
+      "time if the projection is still at or above the target), so the unit stays off the whole day. " +
+      "With \u201cdynamic night start\u201d the start of the shutoff night is chosen between the earliest and the latest " +
+      "start instead (early shutoff and last-run prevention are then ignored): the unit is turned off as soon as " +
+      "the room, projected with the cooling model with the unit off, is still at or above the 6am gate " +
+      "temperature + margin at the end of the night, the compressor has been off for the wait time and the " +
+      "forecast conditions are met. A warm room starts the night earlier, a cold one later (after another " +
+      "compressor run); not reached by the latest start, the unit stays on that night. Without a cooling model " +
+      "the night starts at \u201cnight from\u201d. A unit still off after the last night only takes over the next " +
+      "night if this projection is met. " +
       "With the 6am gate, from the gate time a room below its threshold ends the shutoff night or early off " +
       "(unit on until the next night). " +
       "Early off (Operation tile) does the same from now until the end of the night or for a number of hours, " +
-      "without the forecast conditions; no max. pause reset meanwhile." }),
+      "without the forecast conditions; no max. pause reset meanwhile. " +
+      "Auto early off starts an early off when the room is warmer than its threshold; it lasts until the room is " +
+      "below the indoor target (after ending it manually, it only starts again once the room has cooled down)."),
     form, allowControl ? buttons : el("p", { class: "muted", text: "Read-only: start the server with --allow-control to change these settings." }),
     status, log), true);
   let dirty = false, settings = null, sensorsKey = "";
@@ -924,13 +979,29 @@ function buildTuningView(deviceId) {
     f.enabled.checked = s.enabled;
     f.night_off.checked = s.night_off;
     f.night_off_trend.checked = s.night_off_trend;
+    f.night_off_extend.checked = s.night_off_extend;
+    f.night_off_dynamic.checked = s.night_off_dynamic;
     f.night_off_gate.checked = s.night_off_gate;
-    for (const k of ["normal_shift", "up_max", "down_max", "min_run_min", "max_pause_min", "indoor_target", "min_outdoor", "night_start", "night_end",
-      "night_off_min_mean", "night_off_min_low", "night_off_early_min", "night_off_early_wait_min", "night_off_trend_min", "night_off_gate_temp",
-      "night_off_gate_time"]) f[k].value = String(s[k]);
+    f.early_off_auto.checked = s.early_off_auto;
+    for (const k of ["normal_shift", "up_max", "down_max", "min_run_min", "up_wait_pct", "max_pause_min", "indoor_target", "min_outdoor", "night_start", "night_end",
+      "night_off_min_mean", "night_off_min_low", "night_off_early_min", "night_off_early_wait_min", "night_off_trend_min", "night_off_gate_temp", "early_off_auto_temp",
+      "night_off_gate_time", "night_off_dynamic_from", "night_off_dynamic_until", "night_off_dynamic_margin"]) f[k].value = String(s[k]);
     fillSensors(s.indoor_sensor);
     f.indoor_sensor.value = s.indoor_sensor;
     dirty = false;
+  }
+
+  function coolingText(c) {
+    if (!c) return "–";
+    const m = c.model;
+    if (!m) return `collecting… (${c.samples ?? 0} samples${c.note ? `; ${c.note}` : ""})`;
+    const rate = (r) => `${r > 0 ? "+" : r < 0 ? "\u2212" : ""}${Math.abs(r).toFixed(2)} K/h`;
+    const parts = [`time constant ${Math.round(1 / m.k)} h`];
+    if (m.g) parts.push(`gains ${rate(m.g)}`);
+    if (m.evening) parts.push(`evening ${rate(m.evening)} until ${c.active_end}:00`);
+    if (m.release) parts.push(`after ${c.active_end}:00 ${rate(m.release)} (fading, ${m.release_tau} h)`);
+    parts.push(`${m.n} samples${typeof m.mad === "number" ? `, error \u00b1${m.mad.toFixed(3)} K/h` : ""}`);
+    return parts.join(" · ");
   }
 
   function render(t, dev) {
@@ -943,10 +1014,13 @@ function buildTuningView(deviceId) {
       ["Mode", live.mode ? `${live.mode}${live.note ? ` \u2013 ${live.note}` : ""}` : "–"],
       ["Shift", `${sign(shift)}${t.settings.enabled && typeof st.commanded === "number"
         ? ` \u00b7 commanded ${sign(st.commanded)}${st.confirmed ? "" : " (waiting for the unit)"}` : ""}`],
-      ["Indoor", typeof live.indoor === "number" ? `${live.indoor} °C (target ${t.settings.indoor_target} °C)${
-        typeof live.indoor_trend === "number" ? ` · trend ${live.indoor_trend > 0 ? "+" : ""}${live.indoor_trend.toFixed(2)} K/h` : ""}` : "–"],
+      ["Indoor", typeof live.indoor === "number" ? `${live.indoor} °C (target ${t.settings.indoor_target} °C)` : "–"],
       ["Outdoor", typeof live.outdoor === "number" ? `${live.outdoor} °C (min. ${t.settings.min_outdoor} °C)` : "–"],
+      ["Room cooling (learned)", coolingText(t.cooling)],
       ["Compressor (est.)", st.compressor ?? "–"],
+      ["Water heating", typeof st.water_degree_min === "number"
+        ? `last degree ${st.water_degree_min} min · up step wait ${Math.round(st.water_degree_min * t.settings.up_wait_pct / 10) / 10} min`
+        : "no degree timed yet"],
       ["Forecast", forecastText(t.night_off?.forecast)],
       ["Night-time shutoff", `${t.night_off?.active ? "Unit off – " : ""}${t.night_off?.note ?? "–"}`],
       ["Early off", t.early_off ? `until ${untilText(t.early_off.until)}` : "–"],
@@ -974,6 +1048,7 @@ function buildTuningView(deviceId) {
       up_max: Number(f.up_max.value),
       down_max: Number(f.down_max.value),
       min_run_min: Number(f.min_run_min.value),
+      up_wait_pct: Number(f.up_wait_pct.value),
       max_pause_min: Number(f.max_pause_min.value),
       indoor_target: Number(f.indoor_target.value),
       min_outdoor: Number(f.min_outdoor.value),
@@ -987,8 +1062,15 @@ function buildTuningView(deviceId) {
       night_off_early_wait_min: Number(f.night_off_early_wait_min.value),
       night_off_trend: f.night_off_trend.checked,
       night_off_trend_min: Number(f.night_off_trend_min.value),
+      night_off_extend: f.night_off_extend.checked,
+      night_off_dynamic: f.night_off_dynamic.checked,
+      night_off_dynamic_from: f.night_off_dynamic_from.value,
+      night_off_dynamic_until: f.night_off_dynamic_until.value,
+      night_off_dynamic_margin: Number(f.night_off_dynamic_margin.value),
       night_off_gate: f.night_off_gate.checked,
       night_off_gate_temp: Number(f.night_off_gate_temp.value),
+      early_off_auto: f.early_off_auto.checked,
+      early_off_auto_temp: Number(f.early_off_auto_temp.value),
       night_off_gate_time: f.night_off_gate_time.value,
     };
     if (body.night_off && !settings?.night_off &&
@@ -1047,8 +1129,9 @@ function haSensorTiles(ha) {
 function renderReport(report) {
   const container = $("devices");
   container.replaceChildren();
+  const offNote = offPollMinutes > pollMinutes ? ` (${offPollMinutes} min while the unit is off)` : "";
   $("status-line").textContent =
-    `Updated ${new Date(report.generated_at).toLocaleString()} · auto-update every ${pollMinutes} min · ` +
+    `Updated ${new Date(report.generated_at).toLocaleString()} · auto-update every ${pollMinutes} min${offNote} · ` +
     `${report.account.device_count} device(s) · ` +
     `token valid until ${report.account.token_expiration ? new Date(report.account.token_expiration).toLocaleString() : "–"}`;
 
@@ -1081,16 +1164,30 @@ function renderReport(report) {
 }
 
 // ------------------------------------------------------------------ api
+// A 401 without our JSON error comes from Home Assistant's ingress proxy (its
+// session cookie expired or is not renewed yet, e.g. right after the companion
+// app starts or resumes). The HA frontend renews it within a minute, so retry
+// instead of asking for the Aquarea login.
+const INGRESS_RETRY_MS = 3000;
+const INGRESS_RETRIES = 30;
+
 async function api(path, options = {}) {
-  const res = await fetch(path, { credentials: "same-origin", ...options });
-  let data = null;
-  try { data = await res.json(); } catch { /* non-JSON */ }
-  if (!res.ok) {
-    const err = new Error(data?.error ?? `HTTP ${res.status}`);
-    err.status = res.status;
+  for (let attempt = 0; ; attempt++) {
+    const res = await fetch(path, { credentials: "same-origin", ...options });
+    let data = null;
+    try { data = await res.json(); } catch { /* non-JSON */ }
+    if (res.ok) return data;
+    const ingress = res.status === 401 && data?.error === undefined;
+    if (ingress && attempt < INGRESS_RETRIES) {
+      await new Promise((resolve) => setTimeout(resolve, INGRESS_RETRY_MS));
+      continue;
+    }
+    const err = new Error(ingress
+      ? "Home Assistant session expired (HTTP 401). Please reload the page."
+      : data?.error ?? `HTTP ${res.status}`);
+    err.status = ingress ? 0 : res.status;
     throw err;
   }
-  return data;
 }
 
 const postJSON = (path, body) =>
@@ -1130,6 +1227,8 @@ function showApp(username) {
 function applySession(s) {
   allowControl = !!s.allow_control;
   pollMinutes = s.poll_minutes ?? pollMinutes;
+  offPollMinutes = s.off_poll_minutes ?? pollMinutes;
+  historyGapMinutes = s.history_gap_minutes ?? 3 * pollMinutes;
   currentUser = s.logged_in ? s.username : null;
   tokenExpiration = s.token_expiration ?? null;
 }

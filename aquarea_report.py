@@ -327,14 +327,24 @@ async def gather_device(
 
 
 async def build_report(
-    client: Client, include_consumption: bool, consumption_periods: tuple[str, ...] = CONSUMPTION_PERIODS
+    client: Client,
+    include_consumption: bool,
+    consumption_periods: tuple[str, ...] = CONSUMPTION_PERIODS,
+    refresh_devices: bool = True,
 ) -> dict[str, Any]:
     """Collect the full report using an already logged-in client."""
     # aioaquarea caches the device list (and its raw data) after the first
-    # call; reset it so every report reflects the current cloud state.
-    client._device_manager._devices = None  # noqa: SLF001
+    # call; reset it so the report reflects the current cloud state. The live
+    # status is fetched every time regardless.
+    if refresh_devices:
+        client._device_manager._devices = None  # noqa: SLF001
     capture_raw_status(client)
     devices = await client.get_devices()
+    if not devices and not refresh_devices:
+        # a failed fetch leaves an empty list cached
+        client._device_manager._devices = None  # noqa: SLF001
+        refresh_devices = True
+        devices = await client.get_devices()
     report: dict[str, Any] = {
         "generated_at": dt.datetime.now().astimezone().isoformat(),
         "account": {
@@ -345,7 +355,20 @@ async def build_report(
         "devices": [],
     }
     for info in devices:
-        report["devices"].append(await gather_device(client, info, include_consumption, consumption_periods))
+        data = await gather_device(client, info, include_consumption, consumption_periods)
+        if not refresh_devices and isinstance(data.get("status"), dict) and "error" in data["status"]:
+            # Without a status the history falls back to the device list, which
+            # must be current then.
+            client._device_manager._devices = None  # noqa: SLF001
+            refresh_devices = True
+            try:
+                await client.get_devices()
+                data["raw_device_list_entry"] = safe(lambda: raw_device_list_entry(client, info))
+            except (ApiError, ClientError) as ex:
+                _LOGGER.error("Device list failed: %s", ex)
+                client._device_manager._devices = None  # noqa: SLF001 - retry next time
+                data["raw_device_list_entry"] = None
+        report["devices"].append(data)
     return report
 
 

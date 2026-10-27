@@ -4,8 +4,11 @@ Panasonic stops the compressor when the water outlet stays > target + 3 K for
 3 min (thermo off). Lengthening runs: while the compressor runs and the room
 needs heat ("up" mode), the shift is raised by 1 whenever the water gets within
 1 K of that threshold, up to normal + up_max. When the compressor stops the
-shift goes back to normal, or to normal − down_max in "down" mode (night or
-room warmer than the indoor target), which lowers the target for the next run.
+shift goes back to normal, or to normal − down_max in "down" mode (night hours
+with a shutoff planned or running, or room warmer than the indoor target), which
+lowers the target for the next run. In the night hours without a shutoff (night_off
+off, forecast conditions not met, unit on again after the gate / turned on elsewhere,
+dynamic start not reached) the indoor temperature decides as by day.
 While the compressor is off, a change to "down" mode (e.g. the room gets warmer
 than the target after the stop) also lowers the shift to normal − down_max.
 When the compressor starts again the shift returns to normal (also later while
@@ -17,6 +20,14 @@ the shift below normal and the room not warmer than the indoor target, the shift
 goes back to normal so that it restarts on its own (no shift down again until
 the compressor has run). Below the outdoor
 threshold min_outdoor tuning is off and the shift goes back to normal.
+A +1 step waits up_wait_pct % of the time the last whole water degree took to
+heat up (timed in the current run, else the last timed degree), counted from
+when the water reached its current degree (avoids spikes in the unit's own
+power calculation when the target jumps right as the water rises; as late as
+possible keeps the unit's own regulation from working harder than needed). At
+the thermo off level (water >= target + 3 K, the unit stops 3 min later) the
+step is made at once, without the wait and MIN_STEP. A stop of the compressor
+while a step was still possible (shift below normal + up_max) is logged.
 
 Safety: commands only with --allow-control, heating on and the zone in curve
 mode; at most one +1 step per MIN_STEP and only after the unit reports the
@@ -38,10 +49,26 @@ lowered from the night) goes back to normal. Within
 night_off_early_min minutes before the night this can already happen, so the
 compressor does not start once more just before. With night_off_trend ("prevent
 an unnecessary last run") the same can happen up to night_off_trend_min before
-the night if the indoor temperature, projected with its falling trend (least
-squares over TREND_WINDOW; a rising trend counts as flat), is still at or above
-the indoor target at the start of the night. Only while the compressor is off,
-and only readings from TREND_SETTLE after its stop on count (heating skews them).
+the night if the indoor temperature, projected with the learned cooling model
+(see cooling.py: heat loss to the outdoor temperature from the forecast, evening
+gains until 22:00; a rising rate counts as flat),
+is still at or above the indoor target at the start of the night. Only while the
+compressor is off, and as always night_off_early_wait_min after its stop.
+Stay off after the night (night_off_extend): if the indoor temperature is at or
+above the indoor target at the end of a shutoff night, the unit stays off until
+it is below the target (then on). Projected with the learned cooling model, a room
+that stays warm until the next night stays off the whole day: within the early
+shutoff time, or (with night_off_trend) within night_off_trend_min if the
+projection to the next night is still at or above the target, the next shutoff
+night takes over without turning the unit on in between.
+Dynamic start (night_off_dynamic, alternative to night_off_early_min / night_off_trend,
+which are then ignored): between night_off_dynamic_from and night_off_dynamic_until
+the unit is turned off once the cooling model projects the room (unit off) to be at
+or above night_off_gate_temp + night_off_dynamic_margin at the end of the night; as
+always only night_off_early_wait_min after a compressor stop and with the forecast
+conditions. Not reached by night_off_dynamic_until: no shutoff that night. Without
+a cooling model the night starts at night_start. A unit still off after the last
+night only takes over the next night if this projection is met.
 6am gate (night_off_gate): from night_off_gate_time on, an indoor temperature
 below night_off_gate_temp ends the shutoff night or early off (the first gate time
 after its start) early: the unit is turned on and stays on for the rest of that
@@ -53,6 +80,11 @@ the night_off switch: "down" mode (runs still reach min_run_min), shutoff once
 the compressor has been off for night_off_early_wait_min, on again at the end.
 No max. pause reset during early off. An overlapping shutoff night continues
 without turning the unit on in between.
+
+Auto early off (early_off_auto): when the indoor temperature rises above
+early_off_auto_temp while the unit is on, an early off starts that lasts until
+the room is below the indoor target again. It only starts again once the room
+has been below the indoor target (also after ending an early off manually).
 """
 
 from __future__ import annotations
@@ -60,13 +92,15 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
+import math
 import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from compressor import THERMO_OFF_K
+from cooling import CoolingModel
 import quiet
 
 _LOGGER = logging.getLogger("aquarea_tuning")
@@ -77,6 +111,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "up_max": 3,
     "down_max": 3,
     "min_run_min": 120,  # shift up (within up_max) until a compressor run lasts this long; 0 = off
+    "up_wait_pct": 85,  # up step only this % of the last water degree's heating time after reaching it; 0 = at once
     "max_pause_min": 180,  # shift below normal back to normal after the compressor is off this long; 0 = off
     "indoor_target": 22.5,
     "min_outdoor": 0,  # below this outdoor °C no tuning; shift back to normal
@@ -88,11 +123,18 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "night_off_min_low": -4,  # °C, forecast night minimum must not be below
     "night_off_early_min": 60,  # min before the night: off early while the compressor is off (0 = never)
     "night_off_early_wait_min": 30,  # min after the last compressor stop before turning off
-    "night_off_trend": False,  # prevent an unnecessary last run (indoor trend)
+    "night_off_trend": False,  # prevent an unnecessary last run (learned cooling model)
     "night_off_trend_min": 180,  # min before the night: off if the room stays at/above target until then
+    "night_off_extend": True,  # stay off after the night while the room is at/above the indoor target
+    "night_off_dynamic": False,  # dynamic night start from the cooling model (instead of early/trend)
+    "night_off_dynamic_from": "18:00",  # earliest start
+    "night_off_dynamic_until": "03:00",  # latest start; not reached: no shutoff that night
+    "night_off_dynamic_margin": 0.0,  # K above night_off_gate_temp at the end of the night
     "night_off_gate": True,  # 6am gate: end the shutoff night from the gate time if the room is colder than
     "night_off_gate_temp": 21.0,  # °C
     "night_off_gate_time": "06:00",
+    "early_off_auto": True,  # early off while the room is warmer than early_off_auto_temp
+    "early_off_auto_temp": 23.0,  # °C; lasts until the room is below indoor_target
 }
 LOG_LIMIT = 200
 PUBLIC_LOG = 20
@@ -102,13 +144,9 @@ MAX_COMMANDS_PER_HOUR = 6
 POWER_RETRY = dt.timedelta(minutes=10)  # between power commands
 MAX_OFF_ATTEMPTS = 3
 MIN_EVAL_INTERVAL = dt.timedelta(seconds=30)
+AUTO_EARLY_OFF_MAX = dt.timedelta(days=7)  # safety end of an auto early off
 # history the compressor estimate needs to know the current state
 HISTORY_WINDOW = dt.timedelta(hours=6)  # > the longest min_run_min / max_pause_min
-# indoor trend: least-squares slope over this window, needs TREND_MIN_SPAN of data
-TREND_WINDOW = dt.timedelta(minutes=90)
-TREND_MIN_SPAN = dt.timedelta(minutes=45)
-TREND_MIN_POINTS = 5
-TREND_SETTLE = dt.timedelta(minutes=30)  # only readings once the compressor has been off this long
 NEAR_K = THERMO_OFF_K - 1
 _TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 _SENSOR_RE = re.compile(r"^sensor\.[a-z0-9_]{1,120}$")
@@ -140,25 +178,45 @@ def validate_settings(body: Any) -> dict[str, Any]:
         raise ValueError("night_off must be true or false.")
     if not isinstance(body["night_off_trend"], bool):
         raise ValueError("night_off_trend must be true or false.")
+    if not isinstance(body["night_off_extend"], bool):
+        raise ValueError("night_off_extend must be true or false.")
+    if not isinstance(body["night_off_dynamic"], bool):
+        raise ValueError("night_off_dynamic must be true or false.")
     if not isinstance(body["night_off_gate"], bool):
         raise ValueError("night_off_gate must be true or false.")
+    if not isinstance(body["early_off_auto"], bool):
+        raise ValueError("early_off_auto must be true or false.")
     indoor = body["indoor_target"]
     if isinstance(indoor, bool) or not isinstance(indoor, (int, float)) or not 15 <= indoor <= 28:
         raise ValueError("indoor_target must be a number between 15 and 28.")
     min_outdoor = body["min_outdoor"]
     if isinstance(min_outdoor, bool) or not isinstance(min_outdoor, (int, float)) or not -25 <= min_outdoor <= 20:
         raise ValueError("min_outdoor must be a number between -25 and 20.")
-    for key in ("night_start", "night_end", "night_off_gate_time"):
+    for key in ("night_start", "night_end", "night_off_gate_time", "night_off_dynamic_from", "night_off_dynamic_until"):
         if not isinstance(body[key], str) or not _TIME_RE.match(body[key]):
             raise ValueError(f"{key} must be a time HH:MM.")
+    if body["night_off_dynamic"] and body["night_start"] != body["night_end"]:
+        # circular order from the night end: end < earliest <= night start <= latest < end
+        def rel(key: str) -> int:
+            return (_minutes(body[key]) - _minutes(body["night_end"])) % 1440
+
+        if not 0 < rel("night_off_dynamic_from") <= rel("night_start") <= rel("night_off_dynamic_until"):
+            raise ValueError(
+                "dynamic start: the earliest start must be at or before the night start and the latest "
+                "start at or after it, both outside the night end."
+            )
     if not isinstance(body["indoor_sensor"], str) or not _SENSOR_RE.match(body["indoor_sensor"]):
         raise ValueError("indoor_sensor must be a sensor entity ID (sensor.xyz).")
+    auto_temp = _float(body["early_off_auto_temp"], "early_off_auto_temp", 15, 30)
+    if auto_temp <= round(float(indoor), 1):
+        raise ValueError("early_off_auto_temp must be above indoor_target.")
     return {
         "enabled": body["enabled"],
         "normal_shift": _int(body["normal_shift"], "normal_shift", -5, 5),
         "up_max": _int(body["up_max"], "up_max", 0, 5),
         "down_max": _int(body["down_max"], "down_max", 0, 5),
         "min_run_min": _int(body["min_run_min"], "min_run_min", 0, 240),
+        "up_wait_pct": _int(body["up_wait_pct"], "up_wait_pct", 0, 100),
         "max_pause_min": _int(body["max_pause_min"], "max_pause_min", 0, 300),
         "indoor_target": round(float(indoor), 1),
         "min_outdoor": round(float(min_outdoor), 1),
@@ -172,10 +230,33 @@ def validate_settings(body: Any) -> dict[str, Any]:
         "night_off_early_wait_min": _int(body["night_off_early_wait_min"], "night_off_early_wait_min", 0, 120),
         "night_off_trend": body["night_off_trend"],
         "night_off_trend_min": _int(body["night_off_trend_min"], "night_off_trend_min", 0, 360),
+        "night_off_extend": body["night_off_extend"],
+        "night_off_dynamic": body["night_off_dynamic"],
+        "night_off_dynamic_from": body["night_off_dynamic_from"],
+        "night_off_dynamic_until": body["night_off_dynamic_until"],
+        "night_off_dynamic_margin": _float(body["night_off_dynamic_margin"], "night_off_dynamic_margin", 0, 2),
         "night_off_gate": body["night_off_gate"],
         "night_off_gate_temp": _float(body["night_off_gate_temp"], "night_off_gate_temp", 10, 28),
         "night_off_gate_time": body["night_off_gate_time"],
+        "early_off_auto": body["early_off_auto"],
+        "early_off_auto_temp": auto_temp,
     }
+
+
+def _minutes(hhmm: str) -> int:
+    return int(hhmm[:2]) * 60 + int(hhmm[3:])
+
+
+def dynamic_window(
+    settings: dict[str, Any], window: tuple[dt.datetime, dt.datetime]
+) -> tuple[dt.datetime, dt.datetime]:
+    """(earliest, latest) dynamic start of the night `window`."""
+    start = _minutes(settings["night_start"])
+    before = (start - _minutes(settings["night_off_dynamic_from"])) % 1440
+    after = (_minutes(settings["night_off_dynamic_until"]) - start) % 1440
+    earliest = (window[0] - dt.timedelta(minutes=before)).astimezone()
+    latest = (window[0] + dt.timedelta(minutes=after)).astimezone()
+    return earliest, min(latest, window[1])
 
 
 def in_night(settings: dict[str, Any], now: dt.datetime) -> bool:
@@ -245,27 +326,39 @@ class Observation:
     # during a defrost and its settle time: no tuning / power actions until then
     hold_until: dt.datetime | None = None
     compressor_since: dt.datetime | None = None  # start of the current compressor state (estimate)
-    indoor_trend: float | None = None  # K/h, see indoor_trend()
+    cooling: CoolingModel | None = None  # learned room cooling model (see cooling.py)
+    outdoor_path: Callable[[dt.datetime], float] | None = None  # outdoor temperature over the next hours
+    water_reached: dt.datetime | None = None  # when the water first reached its current degree in this run
+    water_degree_min: float | None = None  # minutes the last whole degree took in this run (water_rise)
 
 
-def indoor_trend(
-    points: list[tuple[dt.datetime, float]], now: dt.datetime, off_since: dt.datetime | None
-) -> float | None:
-    """Least-squares slope (K/h) of the indoor readings within TREND_WINDOW before now,
-    only from TREND_SETTLE after the compressor stopped (off_since; None = not known to be off)."""
-    if off_since is None:
-        return None
-    start = max(now - TREND_WINDOW, off_since + TREND_SETTLE)
-    pts = [(t, v) for t, v in points if start <= t <= now]
-    if len(pts) < TREND_MIN_POINTS or pts[-1][0] - pts[0][0] < TREND_MIN_SPAN:
-        return None
-    xs = [(t - pts[0][0]).total_seconds() / 3600 for t, _ in pts]
-    ys = [v for _, v in pts]
-    mx, my = sum(xs) / len(xs), sum(ys) / len(ys)
-    var = sum((x - mx) ** 2 for x in xs)
-    if var == 0:
-        return None
-    return round(sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / var, 3)
+def water_rise(
+    points: list[tuple[dt.datetime, float]], run_start: dt.datetime | None
+) -> tuple[dt.datetime | None, float | None]:
+    """From (time, water) readings: when the water first reached its current whole degree during the
+    compressor run since run_start, and the minutes the last whole degree before that took.
+    The degree the run started at has no known start, so it is not timed."""
+    if run_start is None:
+        return None, None
+    reached: dict[int, dt.datetime] = {}
+    top: int | None = None
+    current: int | None = None
+    for t, w in points:
+        if t < run_start:
+            continue
+        current = math.floor(w)
+        if top is None:
+            top = current
+        elif current > top:
+            for k in range(top + 1, current + 1):
+                reached[k] = t
+            top = current
+    if current is None or top is None:
+        return None, None
+    last = None
+    if top in reached and top - 1 in reached:
+        last = round((reached[top] - reached[top - 1]).total_seconds() / 60, 1)
+    return reached.get(current), last
 
 
 @dataclass
@@ -323,8 +416,60 @@ def _early_off(state: dict[str, Any], now: dt.datetime) -> tuple[dt.datetime, dt
     return since, until
 
 
-def _early_off_text(until: dt.datetime) -> str:
-    return f"early off until {until.astimezone():%a %H:%M}"
+def wake_times(settings: dict[str, Any], state: dict[str, Any], now: dt.datetime) -> list[dt.datetime]:
+    """Future times the night-time shutoff acts at (night start/end, gate time,
+    early off end), so a slow poll does not miss them."""
+    window = night_window(settings, now)
+    times: list[dt.datetime] = list(window or ())
+    if window is not None and settings["night_off_dynamic"]:
+        times.extend(dynamic_window(settings, window))
+    gt = settings["night_off_gate_time"]
+    day = now.astimezone().date()
+    for d in (day, day + dt.timedelta(days=1)):
+        times.append(dt.datetime.combine(d, dt.time(int(gt[:2]), int(gt[3:]))).astimezone())
+    eo = _early_off(state, now)
+    if eo:
+        times.append(eo[1])
+    return sorted(t for t in times if t > now)
+
+
+def _early_off_text(state: dict[str, Any]) -> str:
+    eo = state.get("early_off") or {}
+    if eo.get("auto"):
+        return f"auto early off (indoor above {_n(eo.get('above'))} °C) until below {_n(eo.get('below'))} °C"
+    until = _parse(eo.get("until"))
+    return f"early off until {until.astimezone():%a %H:%M}" if until else "early off"
+
+
+def _projection(obs: Observation, at: dt.datetime, target: float | None = None) -> tuple[float, str, dt.datetime | None] | None:
+    """Indoor temperature projected to `at` with the learned cooling model, a text, and when it
+    falls below `target` (None if not before `at`)."""
+    if obs.indoor is None or obs.cooling is None or obs.outdoor_path is None:
+        return None
+    end = max(at, obs.now)
+    value, below_at = obs.cooling.project(obs.indoor, obs.now, end, obs.outdoor_path, target)
+    projected = round(value, 1)
+    hours = (end - obs.now).total_seconds() / 3600
+    mean = f", mean {(value - obs.indoor) / hours:+.2f} K/h" if hours > 0 else ""
+    out_end = round(obs.outdoor_path(end), 1)
+    outdoor = _n(obs.outdoor) if out_end == obs.outdoor else f"{_n(obs.outdoor)} → {_n(out_end)}"
+    text = (
+        f"indoor {_n(obs.indoor)} °C, outdoor {outdoor} °C"
+        f"{mean} (cooling model) → {_n(projected)} °C at {at:%H:%M}"
+    )
+    return projected, text, below_at
+
+
+def _extend_note(obs: Observation, target: float, next_night: dt.datetime | None) -> str:
+    base = f"unit off after the night: indoor {_n(obs.indoor)} °C ≥ target {_n(target)} °C"
+    proj = _projection(obs, next_night, target) if next_night is not None else None
+    if proj is None:
+        return f"{base}; on when below the target (no cooling model)"
+    projected, text, below_at = proj
+    if projected >= target:
+        return f"{base}; {text} ≥ target: likely off until the night"
+    about = f" (about {below_at:%H:%M})" if below_at else ""
+    return f"{base}; {text}: on when below the target{about}"
 
 
 class Tuner:
@@ -407,7 +552,10 @@ class Tuner:
         st = entry["state"]
         return {
             "settings": entry["settings"],
-            "state": {k: st.get(k) for k in ("paused", "commanded", "confirmed", "compressor", "commanded_at")},
+            "state": {
+                k: st.get(k)
+                for k in ("paused", "commanded", "confirmed", "compressor", "commanded_at", "water_degree_min")
+            },
             "live": self._live.get(device_id, {}),
             "log": entry["log"][-PUBLIC_LOG:],
             "near_k": NEAR_K,
@@ -416,7 +564,12 @@ class Tuner:
                 "active": bool((st.get("night_off") or {}).get("active")),
             },
             "early_off": (
-                {"since": _iso(eo[0]), "until": _iso(eo[1])}
+                {
+                    "since": _iso(eo[0]),
+                    "until": _iso(eo[1]),
+                    "auto": bool(st["early_off"].get("auto")),
+                    "text": _early_off_text(st),
+                }
                 if (eo := _early_off(st, dt.datetime.now().astimezone()))
                 else None
             ),
@@ -431,8 +584,46 @@ class Tuner:
     def cancel_early_off(self, device_id: str, now: dt.datetime) -> None:
         entry = self.entry(device_id)
         if entry["state"].pop("early_off", None) is not None:
+            entry["state"]["early_off_auto_blocked"] = True  # no auto restart until the room has cooled
             self._log(entry, now, "early off", "Early off ended manually")
             self.save()
+
+    def _auto_early_off(self, entry: dict[str, Any], obs: Observation) -> None:
+        """Start/end the automatic early off (room warmer than early_off_auto_temp)."""
+        s, st, now = entry["settings"], entry["state"], obs.now
+        if obs.indoor is not None and obs.indoor < s["indoor_target"]:
+            st.pop("early_off_auto_blocked", None)
+            cur = st.get("early_off")
+            if isinstance(cur, dict) and cur.get("auto"):
+                st.pop("early_off")
+                self._log(
+                    entry, now, "early off",
+                    f"Auto early off ended: indoor {_n(obs.indoor)} °C < target {_n(s['indoor_target'])} °C",
+                )
+        if (
+            s["early_off_auto"]
+            and obs.control
+            and obs.status_ok
+            and obs.unit_on
+            and obs.indoor is not None
+            and obs.indoor > s["early_off_auto_temp"]
+            and _early_off(st, now) is None
+            and not (st.get("night_off") or {}).get("active")
+            and not st.get("early_off_auto_blocked")
+        ):
+            st["early_off"] = {
+                "since": _iso(now),
+                "until": _iso(now + AUTO_EARLY_OFF_MAX),
+                "auto": True,
+                "above": s["early_off_auto_temp"],
+                "below": s["indoor_target"],
+            }
+            st["early_off_auto_blocked"] = True
+            self._log(
+                entry, now, "early off",
+                f"Auto early off started: indoor {_n(obs.indoor)} °C > {_n(s['early_off_auto_temp'])} °C, "
+                f"until below {_n(s['indoor_target'])} °C",
+            )
 
     # ------------------------------------------------------------------ settings
     def update_settings(self, device_id: str, settings: dict[str, Any], now: dt.datetime) -> None:
@@ -475,7 +666,6 @@ class Tuner:
         live.clear()
         live["checked_at"] = _iso(obs.now)
         live["indoor"] = obs.indoor
-        live["indoor_trend"] = obs.indoor_trend
         live["outdoor"] = obs.outdoor
         try:
             cmd = self._evaluate(entry, live, obs)
@@ -493,6 +683,8 @@ class Tuner:
         # during a defrost hold the compressor edge waits, so it is acted on afterwards
         if obs.compressor is not None and obs.hold_until is None:
             st["compressor"] = obs.compressor
+        if obs.water_degree_min is not None:  # kept for the next run until it has timed a degree itself
+            st["water_degree_min"] = obs.water_degree_min
         ready = obs.curve_mode and obs.shift is not None and obs.limits is not None
 
         if not obs.unit_on:
@@ -506,7 +698,7 @@ class Tuner:
         early_off = _early_off(st, now)
         if not s["enabled"]:
             st.pop("reset_after_on", None)
-            mode, why = self._mode(s, obs, early_off)
+            mode, why = self._mode(s, obs, _early_off_text(st) if early_off else None, self._night_down(entry, obs))
             live["mode"] = "disabled"
             live["note"] = f"would be {mode}: {why}" if ready and obs.operation_on else (
                 "Zone 1 not in curve mode or status unavailable" if not ready else "heating off"
@@ -542,7 +734,7 @@ class Tuner:
         if not obs.operation_on:
             live["mode"], live["note"] = "idle", "heating off"
             return None
-        mode, why = self._mode(s, obs, early_off)
+        mode, why = self._mode(s, obs, _early_off_text(st) if early_off else None, self._night_down(entry, obs))
         live["mode"], live["note"] = mode, why
         if not obs.control:
             live["note"] = f"{why} · control disabled (--allow-control)"
@@ -554,12 +746,19 @@ class Tuner:
         run_min = _run_minutes(obs)
         pause_min = _pause_minutes(obs)
         pause_key = _iso(obs.compressor_since) if obs.compressor == "OFF" and obs.compressor_since else None
-        # after a max. pause reset no shift down until the compressor has run again
-        pause_reset = pause_key is not None and st.get("pause_reset") == pause_key
+        # after a max. pause reset no shift down until the compressor has run again (a flag: the start
+        # of a long pause slides with the history window, so it cannot identify the pause)
+        if obs.compressor == "ON":
+            st.pop("pause_reset", None)
+        pause_reset = obs.compressor == "OFF" and bool(st.get("pause_reset"))
         # a run shorter than the minimum gets the up steps in any mode but "off"
         short = mode != "off" and run_min is not None and run_min < s["min_run_min"]
         if short and mode != "up":
             live["note"] = f"{why} · run {run_min} of min. {s['min_run_min']} min: shift up allowed"
+        # could a +1 step still be made? (checked at the next stop: stopped before max. shift)
+        step_possible = st.pop("step_possible", False) if obs.compressor != "ON" else False
+        if obs.compressor == "ON":
+            st["step_possible"] = (mode == "up" or short) and obs.shift < normal + s["up_max"]
         cmd: Command | None = None
         if mode == "off":
             if obs.shift != normal:
@@ -567,6 +766,17 @@ class Tuner:
         elif st.get("reset_after_on"):
             cmd = Command(normal, obs.shift, "unit turned on after the shutoff: back to normal shift")
         elif prev == "ON" and obs.compressor == "OFF":
+            if step_possible and obs.shift < normal + s["up_max"]:
+                self._log(
+                    entry,
+                    now,
+                    "early stop",
+                    f"Compressor stopped at shift {obs.shift} before max. {normal + s['up_max']} "
+                    f"(water {_n(obs.water)} °C, target {_n(obs.target)} °C)",
+                    shift=obs.shift,
+                    water=obs.water,
+                    target=obs.target,
+                )
             value = normal - s["down_max"] if mode == "down" else normal
             cmd = Command(value, obs.shift, f"compressor stopped ({why})")
         elif prev == "OFF" and obs.compressor == "ON":
@@ -612,12 +822,27 @@ class Tuner:
             and obs.shift < normal + s["up_max"]
         ):
             last_step = _parse(st.get("last_step_at"))
+            degree_min = obs.water_degree_min if obs.water_degree_min is not None else st.get("water_degree_min")
+            step_at = None
+            if s["up_wait_pct"] and obs.water_reached is not None and isinstance(degree_min, (int, float)):
+                step_at = obs.water_reached + dt.timedelta(minutes=degree_min * s["up_wait_pct"] / 100)
+            # thermo off level: the unit stops 3 min later, so no waiting
+            urgent = obs.water >= obs.target + THERMO_OFF_K
             if not st.get("confirmed"):
                 live["note"] = f"{why} · near thermo off, waiting for the unit to report shift {commanded}"
-            elif last_step is not None and now - last_step < MIN_STEP:
+            elif not urgent and last_step is not None and now - last_step < MIN_STEP:
                 live["note"] = f"{why} · near thermo off, next step after {_iso(last_step + MIN_STEP)}"
+            elif not urgent and step_at is not None and now < step_at:
+                live["note"] = (
+                    f"{why} · near thermo off, step at {step_at:%H:%M} ({s['up_wait_pct']} % of the last "
+                    f"degree's {_n(degree_min)} min after the water reached {_n(math.floor(obs.water))} °C "
+                    f"at {obs.water_reached:%H:%M}; at once at {_n(obs.target + THERMO_OFF_K)} °C)"
+                )
             else:
-                reason = f"near thermo off: water {_n(obs.water)} °C ≥ target {_n(obs.target)} + {NEAR_K} K"
+                if urgent:
+                    reason = f"thermo off level: water {_n(obs.water)} °C ≥ target {_n(obs.target)} + {THERMO_OFF_K} K"
+                else:
+                    reason = f"near thermo off: water {_n(obs.water)} °C ≥ target {_n(obs.target)} + {NEAR_K} K"
                 if mode != "up":
                     reason += f" (run {run_min} of min. {s['min_run_min']} min; {why})"
                 cmd = Command(
@@ -640,15 +865,30 @@ class Tuner:
             return None
         return cmd
 
+    def _night_down(self, entry: dict[str, Any], obs: Observation) -> bool:
+        """Night hours with a shutoff planned or running ("down" mode); otherwise the room decides."""
+        s = entry["settings"]
+        window = night_window(s, obs.now)
+        if not s["night_off"] or window is None or not window[0] <= obs.now < window[1]:
+            return False
+        no = entry["state"].get("night_off") or {}
+        if no.get("night") == _iso(window[0]) and (no.get("done") or no.get("gate")):
+            return False  # back on: 6am gate, turned on elsewhere, unit did not turn off
+        if s["night_off_dynamic"] and not no.get("active") and obs.now >= dynamic_window(s, window)[1]:
+            return False  # dynamic start not reached: no shutoff this night
+        # the forecast of the last night-off evaluation (one location for all devices)
+        fc = next((v.get("forecast") for v in self._night_live.values()), None)
+        return bool(no.get("active")) or night_off_conditions(s, fc)[0]
+
     @staticmethod
     def _mode(
-        s: dict[str, Any], obs: Observation, early_off: tuple[dt.datetime, dt.datetime] | None = None
+        s: dict[str, Any], obs: Observation, early_off: str | None = None, night_down: bool = False
     ) -> tuple[str, str]:
         if obs.outdoor is not None and obs.outdoor < s["min_outdoor"]:
             return "off", f"outdoor {_n(obs.outdoor)} °C < {_n(s['min_outdoor'])} °C"
         if early_off is not None:
-            return "down", _early_off_text(early_off[1])
-        if in_night(s, obs.now):
+            return "down", early_off
+        if night_down:
             return "down", f"night {s['night_start']}–{s['night_end']}"
         if obs.indoor is None:
             return "hold", "indoor temperature unavailable"
@@ -749,6 +989,8 @@ class Tuner:
         no = entry["state"].setdefault("night_off", {})
         window = night_window(s, now)
         in_night = window is not None and window[0] <= now < window[1]
+        # dynamic start: (earliest, latest) start, decided with the cooling model below
+        dyn = dynamic_window(s, window) if s["night_off_dynamic"] and window is not None else None
         # shortly before the night (window is then the coming night)
         early = window is not None and not in_night and now >= window[0] - dt.timedelta(
             minutes=s["night_off_early_min"]
@@ -762,17 +1004,21 @@ class Tuner:
             and now >= window[0] - dt.timedelta(minutes=s["night_off_trend_min"])
         )
         early = early or trend_early
+        if dyn is not None:
+            early, trend_early = not in_night and now >= dyn[0], False
+        threshold = round(s["night_off_gate_temp"] + s["night_off_dynamic_margin"], 1)
         key = _iso(window[0]) if window else None
         ok, why = night_off_conditions(s, fc)
         enabled = s["night_off"]
         regular_key, regular_in_night = key, in_night
+        self._auto_early_off(entry, obs)
         eo = _early_off(entry["state"], now)
         if eo is None and "early_off" in entry["state"]:
             entry["state"].pop("early_off")
             self._log(entry, now, "early off", "Early off time over")
         if eo is not None:  # treated like a shutoff night from its start until its end
-            window, in_night, early, trend_early = eo, True, False, False
-            key, ok, why, enabled = f"early off {_iso(eo[0])}", True, _early_off_text(eo[1]), True
+            window, in_night, early, trend_early, dyn = eo, True, False, False, None
+            key, ok, why, enabled = f"early off {_iso(eo[0])}", True, _early_off_text(entry["state"]), True
         if not obs.status_ok:
             live["note"] = "unit status unavailable"
             return None
@@ -780,9 +1026,25 @@ class Tuner:
         wait = last is not None and now - last < POWER_RETRY
 
         if no.get("active") and no.get("night") != key and (in_night or early) and enabled and ok:
-            # overlapping early off / shutoff night: the unit stays off
-            self._log(entry, now, "power", f"Unit stays off: {why}")
-            no["night"] = key
+            proj = _projection(obs, window[0]) if window else None
+            dyn_proj = _projection(obs, window[1]) if dyn is not None else None
+            if no.get("extended") and trend_early and (proj is None or proj[0] < s["indoor_target"]):
+                pass  # still off after the last night; the room may need heat before the next one
+            elif (
+                no.get("extended")
+                and dyn is not None
+                and (
+                    not in_night  # no cooling model: fixed start
+                    if dyn_proj is None
+                    else now >= dyn[1] or dyn_proj[0] < threshold
+                )
+            ):
+                pass  # dynamic start: the room must stay warm enough until the end of the next night
+            else:
+                # overlapping early off / shutoff night: the unit stays off
+                self._log(entry, now, "power", f"Unit stays off: {why}")
+                no["night"] = key
+                no.pop("extended", None)
         # 6am gate: from the first gate time after the start of the shutoff night / early off on,
         # a room below the threshold ends it
         gate = None
@@ -796,8 +1058,32 @@ class Tuner:
             if now >= gate_at and obs.indoor < s["night_off_gate_temp"]:
                 gate = f"6am gate ({gt}): indoor {_n(obs.indoor)} °C < {_n(s['night_off_gate_temp'])} °C"
         if no.get("active"):
+            extend_note = None
             if not (in_night or early) or no.get("night") != key:
                 end_reason = "early off over" if str(no.get("night")).startswith("early off") else "night over"
+                if (
+                    end_reason == "night over"
+                    and s["night_off_extend"]
+                    and enabled
+                    and not no.get("gate")
+                    and not obs.unit_on
+                ):
+                    target = s["indoor_target"]
+                    if obs.indoor is not None and obs.indoor >= target:
+                        end_reason = None
+                        extend_note = _extend_note(obs, target, window[0] if window else None)
+                        if not no.get("extended"):
+                            no["extended"] = True
+                            self._log(
+                                entry, now, "power",
+                                f"Unit stays off after the night: indoor {_n(obs.indoor)} °C ≥ target {_n(target)} °C",
+                            )
+                    elif no.get("extended"):
+                        end_reason = (
+                            "no indoor reading after the night"
+                            if obs.indoor is None
+                            else f"indoor {_n(obs.indoor)} °C < target {_n(target)} °C after the night"
+                        )
             elif not enabled:
                 end_reason = "night-time shutoff disabled"
             elif (
@@ -855,7 +1141,10 @@ class Tuner:
                 no["confirmed"] = True
                 self._log(entry, now, "power", "Unit reports off")
             if end_reason is None:
-                live["note"] = f"unit off: {why}" if eo else f"unit off until {window[1]:%H:%M} ({why})"
+                if extend_note is not None:
+                    live["note"] = extend_note
+                else:
+                    live["note"] = f"unit off: {why}" if eo else f"unit off until {window[1]:%H:%M} ({why})"
                 return None
             if not obs.control:
                 live["note"] = f"{end_reason}, but control is disabled (--allow-control)"
@@ -873,6 +1162,8 @@ class Tuner:
             return None
         if not in_night and not early:
             when = f"next night {window[0]:%H:%M}–{window[1]:%H:%M}" if window else "no night hours set"
+            if dyn is not None:
+                when = f"next night until {window[1]:%H:%M}, dynamic start {dyn[0]:%H:%M}–{dyn[1]:%H:%M}"
             live["note"] = f"{when}: " + (f"unit will be turned off ({why})" if ok else f"stays on ({why})")
             return None
         if no.get("done"):
@@ -897,28 +1188,51 @@ class Tuner:
             later = f"shutoff from {plain_at:%H:%M}" if s["night_off_early_min"] else "shutoff at the start of the night"
             if obs.compressor != "OFF":
                 state = "running" if obs.compressor == "ON" else "state unknown"
-                live["note"] = f"{prefix}: compressor {state}, no indoor trend projection; {later}"
+                live["note"] = f"{prefix}: compressor {state}, no indoor projection; {later}"
                 return None
-            if obs.indoor is None or obs.indoor_trend is None:
-                ready_at = obs.compressor_since + TREND_SETTLE + TREND_MIN_SPAN if obs.compressor_since else None
-                ready = (
-                    f"indoor trend from {ready_at:%H:%M}"
-                    if ready_at is not None and ready_at > now and obs.indoor is not None
-                    else "not enough indoor readings for a trend"
+            if obs.indoor is None or obs.cooling is None or obs.outdoor_path is None:
+                missing = (
+                    "no indoor reading"
+                    if obs.indoor is None
+                    else "no outdoor reading"
+                    if obs.cooling is not None
+                    else "no cooling model yet"
                 )
-                live["note"] = f"{prefix}: {ready}, {later}"
+                live["note"] = f"{prefix}: {missing}, {later}"
                 return None
-            hours = (window[0] - now).total_seconds() / 3600
-            projected = round(obs.indoor + min(obs.indoor_trend, 0.0) * hours, 1)
-            trend_text = (
-                f"indoor {_n(obs.indoor)} °C, trend {obs.indoor_trend:+.2f} K/h → {_n(projected)} °C at "
-                f"{window[0]:%H:%M}"
-            )
+            projected, trend_text, _ = _projection(obs, window[0])
             if projected < s["indoor_target"]:
                 live["note"] = f"{prefix}: {trend_text} < target {_n(s['indoor_target'])} °C, {later}"
                 return None
             trend_text += f" ≥ target {_n(s['indoor_target'])} °C"
             prefix = f"{prefix} ({trend_text})"
+        dyn_text = ""
+        if dyn is not None:
+            prefix = f"dynamic start {dyn[0]:%H:%M}–{dyn[1]:%H:%M}"
+            proj = _projection(obs, window[1])
+            if proj is None:
+                missing = (
+                    "no indoor reading"
+                    if obs.indoor is None
+                    else "no cooling model yet"
+                    if obs.cooling is None
+                    else "no outdoor reading"
+                )
+                if not in_night:
+                    live["note"] = f"{prefix}: {missing}, shutoff from {window[0]:%H:%M}"
+                    return None
+                prefix = f"night ({missing}, fixed start)"
+            else:
+                projected, text, _ = proj
+                reached = projected >= threshold
+                dyn_text = f"{text} {'≥' if reached else '<'} {_n(threshold)} °C"
+                if now >= dyn[1]:
+                    live["note"] = f"no shutoff this night: latest start {dyn[1]:%H:%M} passed ({dyn_text})"
+                    return None
+                if not reached:
+                    live["note"] = f"{prefix}: {dyn_text}; stays on"
+                    return None
+                prefix = f"{prefix} ({dyn_text})"
         wait_min = s["night_off_early_wait_min"]
         # never cut a run short: off only once the compressor has been off for the wait time
         if obs.compressor == "ON":
@@ -928,7 +1242,7 @@ class Tuner:
                 f"shutoff {wait_min} min after it stops"
             )
             return None
-        if obs.compressor is None and eo:
+        if obs.compressor is None and (eo or dyn_text):
             live["note"] = f"{prefix}: compressor state unknown, waiting"
             return None
         if obs.compressor is None and early:
@@ -942,6 +1256,11 @@ class Tuner:
         reason = f"night-time shutoff: {why}"
         if eo:
             reason = f"{why}, compressor off"
+        elif dyn_text:
+            reason = (
+                f"dynamic night-time shutoff (night until {window[1]:%H:%M}), {dyn_text}, "
+                f"compressor off: {why}"
+            )
         elif trend_early:
             reason = (
                 f"early night-time shutoff (no unnecessary last run), night from {window[0]:%H:%M}, "

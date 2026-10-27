@@ -101,6 +101,9 @@ h2.device-title { margin: 8px 0 14px; }
 
 details.card > summary { cursor: pointer; font-weight: 700; font-size: 16px; }
 details.card[open] > summary { margin-bottom: 10px; }
+details.explain { margin: 6px 0; font-size: 13px; }
+details.explain > summary { cursor: pointer; color: var(--muted); }
+details.explain > p { margin: 6px 0 0; }
 
 table { border-collapse: collapse; width: 100%; font-size: 14px; }
 th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }

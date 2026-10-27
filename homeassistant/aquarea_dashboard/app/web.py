@@ -13,7 +13,7 @@ import ipaddress
 import logging
 import os
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -30,12 +30,14 @@ from aioaquarea.data import OperationStatus, QuietMode, UpdateOperationMode, Zon
 from aioaquarea.errors import AuthenticationErrorCodes
 
 import compressor
+import cooling
+import forecast
 import quiet
 import tuning
 from aquarea_report import CONSUMPTION_PERIODS, build_report, parse_heat_curve, raw_device_list_entry, water_target
 from forecast import Forecast, parse_location
 from ha_sensors import HAConfig, fetch_sensors
-from history import HA_PREFIX, append_rows, count_rising_edges, extract_rows, read_rows
+from history import append_rows, count_rising_edges, extract_rows, read_rows
 from token_store import PersistentClient, TokenStore
 
 _LOGGER = logging.getLogger("aquarea_web")
@@ -54,15 +56,34 @@ HA_CONFIG = web.AppKey("ha_config", object)  # HAConfig | None
 HA_HTTP = web.AppKey("ha_http", aiohttp.ClientSession)
 HEAT_CURVE = web.AppKey("heat_curve", object)  # list[(outdoor, water)] | None
 TUNER = web.AppKey("tuner", tuning.Tuner)
+COOLING = web.AppKey("cooling", cooling.CoolingStore)
 FORECAST = web.AppKey("forecast", Forecast)
 FORECAST_HTTP = web.AppKey("forecast_http", aiohttp.ClientSession)
 
 # aioaquarea keeps device zones in a class-level dict, so reports must not be
 # built concurrently (even across different user sessions).
 REPORT_LOCK = asyncio.Lock()
-# Today's energy data is fetched on every poll (the cloud updates it about every
-# 15 min); month/year totals are refreshed less often.
-CONSUMPTION_MAX_AGE = dt.timedelta(minutes=10)
+# Scheduled polls fetch the live status every time but save cloud requests
+# (rate limit) elsewhere: the device list is refreshed hourly; today's energy
+# (updated by the cloud about every 15 min) every DAY_ENERGY_MAX_AGE, but on
+# every poll while a compressor start is possible (unit on, compressor not
+# running), as half the starts are only seen in the average power; month/year
+# totals hourly.
+DEVICES_MAX_AGE = dt.timedelta(hours=1)
+DAY_ENERGY_MAX_AGE = dt.timedelta(minutes=5)
+CONSUMPTION_MAX_AGE = dt.timedelta(hours=1)
+# While the unit is switched off nothing can start on its own: poll every
+# OFF_POLL_MINUTES (and today's energy every DAY_ENERGY_OFF_MAX_AGE), but wake up
+# for the night-time shutoff's times (night start/end, gate, early off end) and
+# poll at the normal interval for FAST_AFTER_COMMAND after a power command.
+OFF_POLL_MINUTES = 5
+DAY_ENERGY_OFF_MAX_AGE = dt.timedelta(minutes=15)
+FAST_AFTER_COMMAND = dt.timedelta(minutes=10)
+
+
+def history_gap(poll_minutes: int) -> dt.timedelta:
+    """Longest distance between history rows that still counts as continuous."""
+    return dt.timedelta(minutes=max(3 * poll_minutes, 2 * OFF_POLL_MINUTES))
 
 
 @dataclass
@@ -72,7 +93,15 @@ class UserSession:
     session_hash: str = ""
     last_report: dict[str, Any] | None = None
     poll_task: asyncio.Task | None = None
-    consumption_at: dt.datetime | None = None
+    consumption_at: dt.datetime | None = None  # month/year totals
+    day_energy_at: dt.datetime | None = None
+    devices_at: dt.datetime | None = None
+    # a compressor start is possible: fetch today's energy on every poll
+    energy_fast: bool = True
+    # every device reports its zones off: poll slowly
+    unit_off: bool = False
+    fast_until: dt.datetime | None = None
+    wake: asyncio.Event = field(default_factory=asyncio.Event)
 
     async def close(self) -> None:
         if self.poll_task:
@@ -122,51 +151,77 @@ def _require_json(request: web.Request) -> None:
 
 
 async def refresh_report(
-    app: web.Application, session: UserSession, include_consumption: bool = True, reuse_consumption: bool = False
+    app: web.Application, session: UserSession, include_consumption: bool = True, scheduled: bool = False
 ) -> dict[str, Any]:
     """Fetch a fresh report, cache it on the session and append to the CSV history.
 
-    With reuse_consumption, today's energy data is always fetched, but month/year
-    totals are only fetched when the cached copy is older than CONSUMPTION_MAX_AGE;
-    otherwise they are carried over from the last report.
+    Scheduled polls only fetch what is due (see DEVICES_MAX_AGE and below) and
+    carry the other energy data over from the last report; other reports fetch
+    everything.
     """
     now = dt.datetime.now(dt.timezone.utc)
-    reuse = (
-        include_consumption
-        and reuse_consumption
-        and session.last_report is not None
-        and session.consumption_at is not None
-        and now - session.consumption_at < CONSUMPTION_MAX_AGE
-    )
-    periods = ("day",) if reuse else CONSUMPTION_PERIODS
+
+    def fresh(at: dt.datetime | None, max_age: dt.timedelta) -> bool:
+        return at is not None and now - at < max_age
+
+    reuse = include_consumption and scheduled and session.last_report is not None
+    if not include_consumption:
+        periods: tuple[str, ...] = ()
+    elif not reuse:
+        periods = CONSUMPTION_PERIODS
+    else:
+        same_day = (
+            session.day_energy_at is not None
+            and session.day_energy_at.astimezone().date() == now.astimezone().date()
+        )
+        day_age = DAY_ENERGY_OFF_MAX_AGE if session.unit_off else DAY_ENERGY_MAX_AGE
+        day_due = session.energy_fast or not same_day or not fresh(session.day_energy_at, day_age)
+        periods = (("day",) if day_due else ()) + (
+            () if fresh(session.consumption_at, CONSUMPTION_MAX_AGE) else ("month", "year")
+        )
+    refresh_devices = not scheduled or not fresh(session.devices_at, DEVICES_MAX_AGE)
     async with REPORT_LOCK:
         await session.client.ensure_token()
         try:
-            report = await build_report(session.client, include_consumption, periods)
+            report = await build_report(session.client, bool(periods), periods, refresh_devices)
         except AuthenticationError as ex:
             if ex.error_code == AuthenticationErrorCodes.INVALID_USERNAME_OR_PASSWORD:
                 raise
             # Token rejected early (e.g. another login on this account): renew once.
             _LOGGER.info("Token rejected (%s), renewing", ex)
             await session.client.login()
-            report = await build_report(session.client, include_consumption, periods)
-    if reuse:
+            report = await build_report(session.client, bool(periods), periods, True)
+            refresh_devices = True
+    if refresh_devices:
+        session.devices_at = now
+    if "day" in periods:
+        session.day_energy_at = now
+    if "month" in periods:
+        session.consumption_at = now
+    if not include_consumption:
+        # report without energy data: fetch it on the next poll
+        session.consumption_at = session.day_energy_at = None
+    elif reuse:
         previous = {d.get("info", {}).get("device_id"): d for d in session.last_report.get("devices", [])}
         for dev in report["devices"]:
             old = (previous.get(dev.get("info", {}).get("device_id"), {}).get("consumption")) or {}
             for key in CONSUMPTION_PERIODS:
-                if key in old and key not in dev.get("consumption", {}):
+                if key in old and key not in (dev.get("consumption") or {}):
                     dev.setdefault("consumption", {})[key] = old[key]
-    elif include_consumption:
-        session.consumption_at = now
-    else:
-        session.consumption_at = None  # report without energy data: fetch it on the next poll
     if app[HA_CONFIG] is not None:
         report["ha_sensors"] = await fetch_sensors(app[HA_HTTP], app[HA_CONFIG])
     await app[FORECAST].refresh(app[FORECAST_HTTP], app[HA_CONFIG])
     for dev in report["devices"]:
         dev["water_target"] = water_target(dev.get("status"), app[HEAT_CURVE])
     session.last_report = report
+    was_off = session.unit_off
+    session.unit_off = bool(report["devices"]) and all(
+        isinstance(d.get("status"), dict) and "error" not in d["status"] and not _zones_on(d["status"])
+        for d in report["devices"]
+    )
+    if was_off and not session.unit_off:
+        session.wake.set()  # switched on elsewhere: end a slow poll pause
+    energy_fast = False
     try:
         append_rows(app[HISTORY_FILE], extract_rows(report))
         midnight = dt.datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
@@ -177,21 +232,46 @@ async def refresh_report(
             rows = read_rows(app[HISTORY_FILE], read_from, device_id)
             today = [r for r in rows if dt.datetime.fromisoformat(r["timestamp"]) >= midnight]
             dev["defrost_cycles_today"] = count_rising_edges(today, "defrost")
-            dev["compressor_today"] = compressor.daily_stats(
-                compressor.estimate(rows), midnight, dt.timedelta(minutes=3 * app[POLL_MINUTES])
-            )
+            estimated = compressor.estimate(rows)
+            dev["compressor_today"] = compressor.daily_stats(estimated, midnight, history_gap(app[POLL_MINUTES]))
+            latest = estimated[-1] if estimated else {}
+            running = latest.get("timestamp") == report["generated_at"] and latest.get("compressor") == "ON"
+            status = dev.get("status")
+            known = isinstance(status, dict) and "error" not in status
+            if (not known or _zones_on(status)) and not running:
+                energy_fast = True
     except OSError as ex:
+        energy_fast = True
         _LOGGER.error("Could not write history: %s", ex)
+    session.energy_fast = energy_fast
     for dev in report["devices"]:
         device_id = dev.get("info", {}).get("device_id")
         if device_id:
+            store = app[COOLING]
+            local_now = dt.datetime.now().astimezone()
+            if store.due(device_id, local_now):
+                sensor = app[TUNER].entry(device_id)["settings"]["indoor_sensor"]
+                try:
+                    await asyncio.to_thread(store.update, device_id, app[HISTORY_FILE], sensor, local_now)
+                except Exception:  # noqa: BLE001 - learning must never break the report
+                    _LOGGER.exception("Cooling update failed for %s", device_id)
             try:
                 await run_tuning(app, session, report, dev)
             except Exception:  # noqa: BLE001 - tuning must never break the report
                 _LOGGER.exception("Tuning failed for %s", device_id)
-            dev["tuning"] = app[TUNER].public(device_id)
+            dev["tuning"] = _tuning_public(app, device_id)
             dev["quiet_auto"] = app[TUNER].public_quiet(device_id)
     return report
+
+
+def _tuning_public(app: web.Application, device_id: str) -> dict[str, Any]:
+    return {**app[TUNER].public(device_id), "cooling": app[COOLING].public(device_id)}
+
+
+def _zones_on(status: dict[str, Any]) -> bool:
+    """The operation mode stays e.g. HEAT when the unit is switched off; the zones go
+    OFF (same source as the "Operation" tile and the history)."""
+    return any((z.get("operation_status") or {}).get("name") == "ON" for z in status.get("zones") or [])
 
 
 def _whole(value: Any) -> int | None:
@@ -220,21 +300,25 @@ def _observe(app: web.Application, report: dict[str, Any], dev: dict[str, Any]) 
         {},
     )
     indoor = sensor.get("value")
-    column = f"{HA_PREFIX}{settings['indoor_sensor']}"
-    indoor_points = [  # heating skews the trend: only readings while the compressor is off
-        (dt.datetime.fromisoformat(r["timestamp"]), r[column])
-        for r in rows
-        if _is_number(r.get(column)) and r.get("compressor") == "OFF"
-    ]
+    outdoor = status.get("temperature_outdoor") if _is_number(status.get("temperature_outdoor")) else None
+    fc = app[FORECAST]
+    fresh = fc.fetched_at is not None and now - fc.fetched_at <= forecast.MAX_AGE
+    outdoor_path = cooling.outdoor_path(now, outdoor, fc.hourly if fresh else []) if outdoor is not None else None
     extra = dev.get("status_extra") or {}
     direction = (status.get("direction") or {}).get("name") if isinstance(status.get("direction"), dict) else None
-    # The operation mode stays e.g. HEAT when the unit is switched off; the zones go OFF
-    # (same source as the "Operation" tile and the history).
-    zones_on = any((z.get("operation_status") or {}).get("name") == "ON" for z in status.get("zones") or [])
+    zones_on = _zones_on(status)
     current = latest.get("timestamp") == report["generated_at"]  # history write may have failed
     comp_state = compressor.state_of(rows) if current else {}
     comp_since = dt.datetime.fromisoformat(comp_state["since"]) if comp_state.get("since") else None
     comp_now = latest.get("compressor") if current else None
+    water_reached, water_degree_min = tuning.water_rise(
+        [
+            (dt.datetime.fromisoformat(r["timestamp"]), r["zone1_water_temperature"])
+            for r in rows
+            if _is_number(r.get("zone1_water_temperature"))
+        ],
+        comp_since if comp_now == "ON" else None,
+    )
     return tuning.Observation(
         now=now,
         control=app[ALLOW_CONTROL],
@@ -246,7 +330,7 @@ def _observe(app: web.Application, report: dict[str, Any], dev: dict[str, Any]) 
         water=zone1.get("temperature") if isinstance(zone1.get("temperature"), (int, float)) else None,
         target=wt.get("target") if isinstance(wt.get("target"), (int, float)) else None,
         indoor=indoor if isinstance(indoor, (int, float)) and not isinstance(indoor, bool) else None,
-        outdoor=status.get("temperature_outdoor") if _is_number(status.get("temperature_outdoor")) else None,
+        outdoor=outdoor,
         # only the row of this report counts (history write may have failed)
         compressor=comp_now,
         compressor_since=comp_since,
@@ -255,7 +339,10 @@ def _observe(app: web.Application, report: dict[str, Any], dev: dict[str, Any]) 
         defrost=extra.get("defrost") == 1,
         quiet=_strict_int((status.get("quiet_mode") or {}).get("value")) if isinstance(status.get("quiet_mode"), dict) else None,
         hold_until=compressor.defrost_hold_until(rows, now, extra.get("defrost") == 1),
-        indoor_trend=tuning.indoor_trend(indoor_points, now, comp_since if comp_now == "OFF" else None),
+        cooling=app[COOLING].model(device_id),
+        outdoor_path=outdoor_path,
+        water_reached=water_reached,
+        water_degree_min=water_degree_min,
     )
 
 
@@ -309,6 +396,7 @@ async def run_night_off(app: web.Application, session: UserSession, dev: dict[st
     except (ControlError, AuthenticationError, ApiError, ClientError, aiohttp.ClientError) as ex:
         error = str(ex) or type(ex).__name__
         _LOGGER.warning("Night-time shutoff command failed: %s", error)
+    session.fast_until = obs.now + FAST_AFTER_COMMAND
     tuner.record_power(device_id, cmd, obs.now, error)
     return True
 
@@ -371,14 +459,38 @@ async def run_tuning(app: web.Application, session: UserSession, report: dict[st
     tuner.record(device_id, cmd, obs.now, error)
 
 
+def _poll_delay(app: web.Application, session: UserSession) -> float:
+    """Seconds until the next scheduled poll."""
+    normal = app[POLL_MINUTES] * 60
+    now = dt.datetime.now().astimezone()
+    if not session.unit_off or (session.fast_until is not None and now < session.fast_until):
+        return normal
+    delay = max(normal, OFF_POLL_MINUTES * 60)
+    tuner = app[TUNER]
+    for dev in (session.last_report or {}).get("devices", []):
+        device_id = dev.get("info", {}).get("device_id")
+        if device_id:
+            entry = tuner.entry(device_id)
+            for at in tuning.wake_times(entry["settings"], entry["state"], now):
+                # just after the event, but not sooner than the normal interval
+                delay = min(delay, max(normal, (at - now).total_seconds() + 5))
+    return delay
+
+
 async def poll_loop(app: web.Application, session: UserSession, poll_now: bool = False) -> None:
-    interval = app[POLL_MINUTES] * 60
     while True:
         if not poll_now:
-            await asyncio.sleep(interval)
+            session.wake.clear()
+            try:
+                await asyncio.wait_for(session.wake.wait(), _poll_delay(app, session))
+            except asyncio.TimeoutError:
+                pass
+            else:
+                # woken from a slow pause (unit switched on): normal interval from now
+                await asyncio.sleep(app[POLL_MINUTES] * 60)
         poll_now = False
         try:
-            await refresh_report(app, session, reuse_consumption=True)
+            await refresh_report(app, session, scheduled=True)
         except asyncio.CancelledError:
             raise
         except Exception as ex:  # noqa: BLE001 - keep polling on any failure
@@ -393,6 +505,8 @@ def _session_info(request: web.Request, session: UserSession | None) -> dict[str
         "token_expiration": expiry.isoformat() if expiry else None,
         "allow_control": request.app[ALLOW_CONTROL],
         "poll_minutes": request.app[POLL_MINUTES],
+        "off_poll_minutes": max(request.app[POLL_MINUTES], OFF_POLL_MINUTES),
+        "history_gap_minutes": history_gap(request.app[POLL_MINUTES]).total_seconds() / 60,
     }
 
 
@@ -625,6 +739,8 @@ async def api_device_power(request: web.Request) -> web.Response:
     except (ApiError, ClientError, aiohttp.ClientError) as ex:
         _LOGGER.warning("Control error: %s", ex)
         return web.json_response({"error": f"Aquarea API error: {ex}"}, status=502)
+    session.fast_until = dt.datetime.now().astimezone() + FAST_AFTER_COMMAND
+    session.wake.set()
     return web.json_response({"ok": True, "device_id": device_id, "on": on})
 
 
@@ -719,7 +835,7 @@ async def api_tuning(request: web.Request) -> web.Response:
     _LOGGER.warning("CONTROL %s: tuning device %s settings %s", session.client.username, device_id, settings)
     tuner = request.app[TUNER]
     tuner.update_settings(device_id, settings, dt.datetime.now().astimezone())
-    return web.json_response({"ok": True, "tuning": tuner.public(device_id)})
+    return web.json_response({"ok": True, "tuning": _tuning_public(request.app, device_id)})
 
 
 async def api_early_off(request: web.Request) -> web.Response:
@@ -763,7 +879,7 @@ async def api_early_off(request: web.Request) -> web.Response:
         tuner.start_early_off(device_id, until, now)
     else:
         return web.json_response({"error": "action must be morning, hours or cancel."}, status=400)
-    return web.json_response({"ok": True, "tuning": tuner.public(device_id)})
+    return web.json_response({"ok": True, "tuning": _tuning_public(request.app, device_id)})
 
 
 # --------------------------------------------------------------------------- #
@@ -845,6 +961,7 @@ def create_app(
     app[HA_CONFIG] = ha_config
     app[HEAT_CURVE] = heat_curve
     app[TUNER] = tuning.Tuner(tuning_file)
+    app[COOLING] = cooling.CoolingStore(tuning_file.with_name("cooling.json"))
     app[FORECAST] = Forecast(location)
     app.router.add_get("/", index)
     app.router.add_get("/api/session", api_session)
