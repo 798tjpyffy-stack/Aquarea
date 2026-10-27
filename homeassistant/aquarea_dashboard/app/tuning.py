@@ -20,20 +20,18 @@ the shift below normal and the room not warmer than the indoor target, the shift
 goes back to normal so that it restarts on its own (no shift down again until
 the compressor has run). Below the outdoor
 threshold min_outdoor tuning is off and the shift goes back to normal.
-A +1 step waits up_wait_pct % of the time the last whole water degree took to
-heat up (timed in the current run, else the last timed degree), counted from
-when the water reached its current degree (avoids spikes in the unit's own
-power calculation when the target jumps right as the water rises; as late as
-possible keeps the unit's own regulation from working harder than needed). At
-the thermo off level (water >= target + 3 K, the unit stops 3 min later) the
-step is made at once, without the wait and MIN_STEP. A stop of the compressor
+The +1 step follows the unit's thermo off timer (thermo.ThermoWatch, from the
+live HeishaMon values): the unit stops 3 min after the outlet first went above
+target + 3 K (continuously, same target); the step is sent step_lead_s before
+that, which lifts the target and resets the timer. At most one step per timer
+run, and only after the unit reports the previous value. A stop of the compressor
 while a step was still possible (shift below normal + up_max) is logged.
 
 Safety: commands only with --allow-control, heating on and the zone in curve
-mode; at most one +1 step per MIN_STEP and only after the unit reports the
-previous value; at most MAX_COMMANDS_PER_HOUR commands per hour and
-MAX_COMMANDS_PER_DAY per 24 h (the unit likely stores settings in EEPROM,
-whose write endurance is unknown); a shift changed
+mode; a command the unit has not taken over after RESEND_AFTER is sent once
+more; at most MAX_COMMANDS_PER_HOUR commands per hour and
+MAX_COMMANDS_PER_DAY per 24 h (the unit stores settings in EEPROM, whose write
+endurance is limited); a shift changed
 elsewhere (app, unit, this dashboard's manual control) pauses tuning. During a
 defrost and compressor.DEFROST_SETTLE_MS after it (Observation.hold_until) no
 shift or power command is sent; compressor edges are acted on afterwards.
@@ -94,14 +92,13 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
-import math
 import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from compressor import THERMO_OFF_K
+from compressor import THERMO_MS, THERMO_OFF_K
 from cooling import CoolingModel
 import quiet
 
@@ -113,7 +110,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "up_max": 3,
     "down_max": 3,
     "min_run_min": 120,  # shift up (within up_max) until a compressor run lasts this long; 0 = off
-    "up_wait_pct": 85,  # up step only this % of the last water degree's heating time after reaching it; 0 = at once
+    "step_lead_s": 60,  # +1 step this many seconds before the unit's thermo off
     "max_pause_min": 180,  # shift below normal back to normal after the compressor is off this long; 0 = off
     "indoor_target": 22.5,
     "min_outdoor": 0,  # below this outdoor °C no tuning; shift back to normal
@@ -140,8 +137,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
 }
 LOG_LIMIT = 200
 PUBLIC_LOG = 20
-MIN_STEP = dt.timedelta(minutes=5)
+MIN_STEP_LEAD_S, MAX_STEP_LEAD_S = 20, 150
 CONFIRM_TIMEOUT = dt.timedelta(minutes=20)
+RESEND_AFTER = dt.timedelta(seconds=20)  # unconfirmed command: send once more
 MAX_COMMANDS_PER_HOUR = 6
 MAX_COMMANDS_PER_DAY = 48
 POWER_RETRY = dt.timedelta(minutes=10)  # between power commands
@@ -151,6 +149,7 @@ AUTO_EARLY_OFF_MAX = dt.timedelta(days=7)  # safety end of an auto early off
 # history the compressor estimate needs to know the current state
 HISTORY_WINDOW = dt.timedelta(hours=6)  # > the longest min_run_min / max_pause_min
 NEAR_K = THERMO_OFF_K - 1
+THERMO_OFF_AFTER = dt.timedelta(milliseconds=THERMO_MS)
 _TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 _SENSOR_RE = re.compile(r"^sensor\.[a-z0-9_]{1,120}$")
 
@@ -219,7 +218,7 @@ def validate_settings(body: Any) -> dict[str, Any]:
         "up_max": _int(body["up_max"], "up_max", 0, 5),
         "down_max": _int(body["down_max"], "down_max", 0, 5),
         "min_run_min": _int(body["min_run_min"], "min_run_min", 0, 240),
-        "up_wait_pct": _int(body["up_wait_pct"], "up_wait_pct", 0, 100),
+        "step_lead_s": _int(body["step_lead_s"], "step_lead_s", MIN_STEP_LEAD_S, MAX_STEP_LEAD_S),
         "max_pause_min": _int(body["max_pause_min"], "max_pause_min", 0, 300),
         "indoor_target": round(float(indoor), 1),
         "min_outdoor": round(float(min_outdoor), 1),
@@ -331,37 +330,7 @@ class Observation:
     compressor_since: dt.datetime | None = None  # start of the current compressor state (estimate)
     cooling: CoolingModel | None = None  # learned room cooling model (see cooling.py)
     outdoor_path: Callable[[dt.datetime], float] | None = None  # outdoor temperature over the next hours
-    water_reached: dt.datetime | None = None  # when the water first reached its current degree in this run
-    water_degree_min: float | None = None  # minutes the last whole degree took in this run (water_rise)
-
-
-def water_rise(
-    points: list[tuple[dt.datetime, float]], run_start: dt.datetime | None
-) -> tuple[dt.datetime | None, float | None]:
-    """From (time, water) readings: when the water first reached its current whole degree during the
-    compressor run since run_start, and the minutes the last whole degree before that took.
-    The degree the run started at has no known start, so it is not timed."""
-    if run_start is None:
-        return None, None
-    reached: dict[int, dt.datetime] = {}
-    top: int | None = None
-    current: int | None = None
-    for t, w in points:
-        if t < run_start:
-            continue
-        current = math.floor(w)
-        if top is None:
-            top = current
-        elif current > top:
-            for k in range(top + 1, current + 1):
-                reached[k] = t
-            top = current
-    if current is None or top is None:
-        return None, None
-    last = None
-    if top in reached and top - 1 in reached:
-        last = round((reached[top] - reached[top - 1]).total_seconds() / 60, 1)
-    return reached.get(current), last
+    thermo_since: dt.datetime | None = None  # outlet above target + 3 K since (unit's thermo off timer)
 
 
 @dataclass
@@ -375,8 +344,10 @@ class Command:
     value: int
     previous: int
     reason: str
-    step: bool = False  # +1 step near thermo off
+    step: bool = False  # +1 step before thermo off
     restore: bool = False  # back to normal after disabling
+    resend: bool = False  # the same value again, the unit has not taken it over
+    over_since: str | None = None  # step: start of the thermo off timer it was made for
 
 
 def _iso(t: dt.datetime) -> str:
@@ -505,6 +476,7 @@ class Tuner:
             try:
                 stored = dict(entry.get("settings") or {})
                 stored.pop("night_off_max_mean", None)  # replaced by night_off_min_mean (0.1.21)
+                stored.pop("up_wait_pct", None)  # replaced by step_lead_s (0.2.0)
                 settings = validate_settings({**DEFAULT_SETTINGS, **stored})
             except ValueError as ex:
                 _LOGGER.error("Invalid tuning settings for %s, using defaults: %s", device_id, ex)
@@ -560,7 +532,7 @@ class Tuner:
             "settings": entry["settings"],
             "state": {
                 k: st.get(k)
-                for k in ("paused", "commanded", "confirmed", "compressor", "commanded_at", "water_degree_min")
+                for k in ("paused", "commanded", "confirmed", "compressor", "commanded_at", "resent")
             },
             "live": self._live.get(device_id, {}),
             "log": entry["log"][-PUBLIC_LOG:],
@@ -667,11 +639,12 @@ class Tuner:
         self._log(entry, now, "paused", f"Tuning paused: {reason}")
 
     # ------------------------------------------------------------------ control
-    def evaluate(self, device_id: str, obs: Observation) -> Command | None:
-        """Decide on a shift command; the caller sends it and calls record()."""
+    def evaluate(self, device_id: str, obs: Observation, force: bool = False) -> Command | None:
+        """Decide on a shift command; the caller sends it and calls record().
+        force: also within MIN_EVAL_INTERVAL of the last evaluation (thermo timer, resend)."""
         live = self._live.setdefault(device_id, {})
         last = _parse(live.get("checked_at"))
-        if last is not None and obs.now - last < MIN_EVAL_INTERVAL:
+        if not force and last is not None and obs.now - last < MIN_EVAL_INTERVAL:
             return None
         entry = self.entry(device_id)
         before = json.dumps(entry, sort_keys=True)
@@ -695,8 +668,6 @@ class Tuner:
         # during a defrost hold the compressor edge waits, so it is acted on afterwards
         if obs.compressor is not None and obs.hold_until is None:
             st["compressor"] = obs.compressor
-        if obs.water_degree_min is not None:  # kept for the next run until it has timed a degree itself
-            st["water_degree_min"] = obs.water_degree_min
         ready = obs.curve_mode and obs.shift is not None and obs.limits is not None
 
         if not obs.unit_on:
@@ -733,6 +704,7 @@ class Tuner:
         elif obs.shift == commanded:
             if not st.get("confirmed"):
                 st["confirmed"] = True
+                st.pop("resent", None)
                 self._log(entry, now, "confirmed", f"Unit reports shift {obs.shift}")
         elif st.get("confirmed") or obs.shift != st.get("previous"):
             self._pause(entry, now, f"shift changed outside tuning ({commanded} → {obs.shift})")
@@ -742,6 +714,13 @@ class Tuner:
             if sent is None or now - sent > CONFIRM_TIMEOUT:
                 self._pause(entry, now, f"unit still reports shift {obs.shift}, not {commanded}")
                 return None
+            if obs.control and not st.get("resent") and now - sent >= RESEND_AFTER:
+                live["mode"] = "resend"
+                live["note"] = f"unit still reports shift {obs.shift} after {int((now - sent).total_seconds())} s"
+                cmd = Command(
+                    commanded, obs.shift, f"{live['note']}: shift {commanded} sent again", resend=True
+                )
+                return None if self._limited(entry, live, now, cmd, live["note"]) else cmd
 
         if not obs.operation_on:
             live["mode"], live["note"] = "idle", "heating off"
@@ -830,31 +809,31 @@ class Tuner:
             and obs.heating
             and obs.water is not None
             and obs.target is not None
-            and obs.water >= obs.target + NEAR_K
+            and obs.water > obs.target + NEAR_K
             and obs.shift < normal + s["up_max"]
         ):
-            last_step = _parse(st.get("last_step_at"))
-            degree_min = obs.water_degree_min if obs.water_degree_min is not None else st.get("water_degree_min")
-            step_at = None
-            if s["up_wait_pct"] and obs.water_reached is not None and isinstance(degree_min, (int, float)):
-                step_at = obs.water_reached + dt.timedelta(minutes=degree_min * s["up_wait_pct"] / 100)
-            # thermo off level: the unit stops 3 min later, so no waiting
-            urgent = obs.water >= obs.target + THERMO_OFF_K
+            since = obs.thermo_since
+            off_at = since + THERMO_OFF_AFTER if since is not None else None
+            step_at = off_at - dt.timedelta(seconds=s["step_lead_s"]) if off_at is not None else None
+            threshold = f"target {_n(obs.target)} + {THERMO_OFF_K} K"
             if not st.get("confirmed"):
                 live["note"] = f"{why} · near thermo off, waiting for the unit to report shift {commanded}"
-            elif not urgent and last_step is not None and now - last_step < MIN_STEP:
-                live["note"] = f"{why} · near thermo off, next step after {_iso(last_step + MIN_STEP)}"
-            elif not urgent and step_at is not None and now < step_at:
+            elif since is None:
                 live["note"] = (
-                    f"{why} · near thermo off, step at {step_at:%H:%M} ({s['up_wait_pct']} % of the last "
-                    f"degree's {_n(degree_min)} min after the water reached {_n(math.floor(obs.water))} °C "
-                    f"at {obs.water_reached:%H:%M}; at once at {_n(obs.target + THERMO_OFF_K)} °C)"
+                    f"{why} · near thermo off: water {_n(obs.water)} °C, thermo off timer starts above {threshold}"
+                )
+            elif st.get("step_over_since") == _iso(since):
+                live["note"] = f"{why} · step sent for this thermo off timer, waiting for the new target"
+            elif now < step_at:
+                live["note"] = (
+                    f"{why} · thermo off timer running since {since:%H:%M:%S} (water above {threshold}): "
+                    f"unit stops about {off_at:%H:%M:%S}, step at {step_at:%H:%M:%S}"
                 )
             else:
-                if urgent:
-                    reason = f"thermo off level: water {_n(obs.water)} °C ≥ target {_n(obs.target)} + {THERMO_OFF_K} K"
-                else:
-                    reason = f"near thermo off: water {_n(obs.water)} °C ≥ target {_n(obs.target)} + {NEAR_K} K"
+                reason = (
+                    f"thermo off timer: water {_n(obs.water)} °C above {threshold} since {since:%H:%M:%S}, "
+                    f"unit stops about {off_at:%H:%M:%S}"
+                )
                 if mode != "up":
                     reason += f" (run {run_min} of min. {s['min_run_min']} min; {why})"
                 cmd = Command(
@@ -862,12 +841,18 @@ class Tuner:
                     obs.shift,
                     reason,
                     step=True,
+                    over_since=_iso(since),
                 )
         if cmd is None:
             return None
         cmd.value = max(lo, min(hi, cmd.value))
         if cmd.value == obs.shift or (cmd.value == commanded and not st.get("confirmed")):
             return None
+        return None if self._limited(entry, live, now, cmd, why) else cmd
+
+    def _limited(self, entry: dict[str, Any], live: dict[str, Any], now: dt.datetime, cmd: Command, why: str) -> bool:
+        """True (with a note and log entry) if the hourly or daily command limit is reached."""
+        st = entry["state"]
         recent = _sent_within(st, now, dt.timedelta(hours=1))
         daily = _sent_within(st, now, dt.timedelta(days=1))
         limit = None
@@ -880,8 +865,21 @@ class Tuner:
             text = f"Limit {limit.split(',')[0]}: {cmd.reason}"
             if not entry["log"] or entry["log"][-1].get("text") != text:
                 self._log(entry, now, "skipped", text, to=cmd.value)
-            return None
-        return cmd
+            return True
+        return False
+
+    def resend_due(self, device_id: str, now: dt.datetime) -> bool:
+        """An unconfirmed command waits for its single resend."""
+        st = self.entry(device_id)["state"]
+        sent = _parse(st.get("commanded_at"))
+        return (
+            self.entry(device_id)["settings"]["enabled"]
+            and st.get("commanded") is not None
+            and not st.get("confirmed")
+            and not st.get("resent")
+            and sent is not None
+            and RESEND_AFTER <= now - sent <= CONFIRM_TIMEOUT
+        )
 
     def _night_down(self, entry: dict[str, Any], obs: Observation) -> bool:
         """Night hours with a shutoff planned or running ("down" mode); otherwise the room decides."""
@@ -923,12 +921,19 @@ class Tuner:
             self._log(entry, now, "error", f"Sending shift {cmd.value} failed: {error}", to=cmd.value)
         else:
             self._log(entry, now, "command", cmd.reason, **{"from": cmd.previous, "to": cmd.value})
-            if entry["settings"]["enabled"]:
+            if entry["settings"]["enabled"] and cmd.resend:
+                st.update(commanded_at=_iso(now), resent=True)  # keeps "previous" of the first send
+            elif entry["settings"]["enabled"]:
                 st.update(
-                    commanded=cmd.value, previous=cmd.previous, commanded_at=_iso(now), confirmed=False, sent=True
+                    commanded=cmd.value,
+                    previous=cmd.previous,
+                    commanded_at=_iso(now),
+                    confirmed=False,
+                    sent=True,
+                    resent=False,
                 )
                 if cmd.step:
-                    st["last_step_at"] = _iso(now)
+                    st["step_over_since"] = cmd.over_since
             elif not cmd.restore:
                 st["restore"] = entry["settings"]["normal_shift"]  # disabled while sending
         self.save()

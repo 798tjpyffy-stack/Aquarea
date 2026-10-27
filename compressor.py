@@ -1,4 +1,7 @@
-"""Compressor on/off estimate from the CSV history (the cloud has no compressor flag).
+"""Compressor on/off from the CSV history.
+
+Rows from HeishaMon carry the measured compressor frequency: ON if > 0 Hz.
+Older rows (Panasonic cloud, no compressor flag) are estimated as follows.
 
 Standby ~10 W, circulation pump only ~40 W, compressor several hundred W
 (15-min averages). Between power updates the Zone 1 water temperature decides:
@@ -135,6 +138,30 @@ def estimate(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for i, (t, p) in enumerate(pts):
         w = _num(p.get("zone1_water_temperature"))
         op = str(p.get("operation_status") or "").upper()
+        freq = _num(p.get("compressor_freq"))
+        if freq is not None:  # HeishaMon row: the compressor frequency is measured
+            nxt = "ON" if freq > 0 else "OFF"
+            why = f"compressor {_n(freq)} Hz"
+            tgt = _num(p.get("zone1_target_temperature"))
+            near = None
+            if nxt == "ON" and w is not None and tgt is not None and not _defrost(p):
+                if w - tgt > THERMO_OFF_K:
+                    near = "ABOVE"
+                elif w - tgt > THERMO_OFF_K - 1:
+                    near = "NEAR"
+            if near == "ABOVE":
+                why += f" · above thermo off threshold (target {_n(tgt)} °C + {THERMO_OFF_K} K)"
+            elif near == "NEAR":
+                why += f" · near thermo off (target {_n(tgt)} °C + {THERMO_OFF_K} K)"
+            if w is not None:
+                prev_w, low, high = w, w, w
+            prev_op = op or prev_op
+            above_since, recovering, water_off = None, False, None
+            state = nxt
+            p["compressor"] = state
+            p["compressor_why"] = why
+            p["near_thermo_off"] = near
+            continue
         if w is None or not op:  # incomplete row: keep the state
             p["compressor"] = state
             p["compressor_why"] = "unchanged" if state else None

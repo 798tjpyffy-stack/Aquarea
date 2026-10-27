@@ -1,43 +1,58 @@
 # Aquarea Dashboard
 
-Dashboard for Panasonic Aquarea heat pumps (Aquarea Smart Cloud), opened from the
+Dashboard for Panasonic Aquarea heat pumps read and controlled locally through
+[HeishaMon](https://github.com/Egyras/HeishaMon) over MQTT, opened from the
 Home Assistant sidebar ("Aquarea").
 
-## Usage
+## Setup
 
-1. Start the app and open **Aquarea** in the sidebar.
-2. Log in with your Panasonic account. The password is not stored; only the
-   login token (in the app's private `/data`), which is renewed automatically.
-   The login is shared by all Home Assistant clients (browser, companion app).
-3. Data is fetched every *Update interval* minutes, also when no browser is open.
+1. Install and start the **Mosquitto broker** app and create a user for
+   HeishaMon (Settings → People → Users, or the Mosquitto `logins` option).
+2. In HeishaMon's settings set the MQTT server (your Home Assistant host),
+   port 1883, that user and password, and note the **base topic** (default
+   `panasonic_heat_pump`).
+3. Set `mqtt_base_topic` here if you changed it, start the app and open
+   **Aquarea** in the sidebar. The broker address and credentials come from
+   the Mosquitto app automatically.
 
-Panasonic allows one active login per account: logging in with the Panasonic app
-can interrupt the dashboard. A second Panasonic account (shared device) avoids this.
+HeishaMon publishes every value when it changes and all values every 5 minutes.
+The dashboard shows HeishaMon as offline when its LWT says so or no value came
+for 330 s; control commands are then refused.
 
 ## Options
 
 | Option | Description |
 | --- | --- |
-| `poll_minutes` | Update interval (1–1440, default 1). Every update fetches the live status (1 cloud request). To save requests, the device list and the month/year energy totals are refreshed hourly, today's energy every 5 minutes, but on every update while the unit is on and the compressor is not running (half the compressor starts are only seen in the energy data). While the unit is switched off, updates run every 5 minutes (today's energy every 15), except at the night-time shutoff's times (night start/end, gate time, end of an early off) and for 10 minutes after a power command. The refresh button fetches everything. |
-| `allow_control` | Enable changing the heat pump from the dashboard (heating target/shift, power, quiet mode) and the automatic functions (hysteresis tuning, night-time shutoff, quiet mode auto). |
+| `poll_minutes` | History interval (1–1440, default 1): every interval a row is appended to the history and the automatic functions are evaluated. Live values (tiles, power) update continuously. |
+| `allow_control` | Enable changing the heat pump from the dashboard (curve shift, power, quiet mode) and the automatic functions (hysteresis tuning, night-time shutoff, quiet mode auto). |
 | `debug` | Verbose logging. |
 | `ha_sensors` | Home Assistant temperature sensors (entity IDs) shown as tiles and recorded in the history. Empty: all temperature sensors (max. 12). |
-| `heat_curve` | Zone 1 heating curve as `OUTDOOR:WATER` points, e.g. `5:30,-7:34` (linear in between, flat outside). The dashboard shows and records the target water temperature = curve + shift. |
+| `mqtt_base_topic` | HeishaMon's MQTT base topic (default `panasonic_heat_pump`). |
 
 ## Data
 
-`history.csv` (timestamp, operation status, pump duty, outdoor temperature,
-zone 1 water temperature) is written to the app config folder:
-`/addon_configs/<repo>_aquarea_dashboard/history.csv` (Samba / File editor).
+`history.csv` (operation, pump, outdoor, water outlet/inlet, target, shift,
+compressor frequency, flow, power in/out, energy today, …) is written to the
+app config folder: `/addon_configs/<repo>_aquarea_dashboard/history.csv`
+(Samba / File editor). Rows from the former Panasonic cloud version stay
+readable.
+
+Energy is integrated from HeishaMon's power values (electric in, heat out) and
+stored per hour and day in the app's private `/data/energy.json`; past days
+from the cloud history are imported once (input only). Compressor stops and
+restarts are kept in `/data/thermo.json`.
 
 ## Hysteresis tuning
 
 With `allow_control` and Zone 1 on a heating curve, the **Hysteresis tuning**
 section changes the curve shift automatically to lengthen compressor runs:
 
-- While the compressor runs (estimated from the history) and the room needs heat,
-  the shift goes up by 1 when the water is within 1 K of the thermo off point
-  (target + 3 K), up to *normal + max. shift up*.
+- While the compressor runs (frequency > 0 Hz) and the room needs heat, the
+  shift goes up by 1 shortly before the unit would stop: when the water outlet
+  goes above target + 3 K the unit's 3-minute thermo off timer starts, and the
+  step is sent **step lead** seconds (default 60) before it runs out, once per
+  timer, up to *normal + max. shift up*. If the unit does not confirm a
+  command within 20 s it is resent once.
 - When the compressor stops, the shift returns to normal, or to *normal − shift
   down* in the night hours while a night-time shutoff is planned or running, or
   when the indoor sensor is above the indoor target. In the night hours without
@@ -53,14 +68,6 @@ section changes the curve shift automatically to lengthen compressor runs:
   (night, warm room), never above *normal + max. shift up* (so a run can still
   end earlier). After that the shift returns to normal and the compressor stops
   on its own.
-- **Up step wait** (default 85 %, 0 = at once): a +1 step waits this share of
-  the time the water took for its last whole degree, counted from when it
-  reached its current degree. A late step keeps the unit's own regulation from
-  working harder than needed and avoids spikes in its power calculation. The
-  degree is timed in the current run, else the last timed degree is used. Once
-  the water reaches the thermo off point (target + 3 K; the unit stops 3 min
-  later) the step is made at once. If the compressor stops while a step was
-  still possible, the log shows "Compressor stopped at shift … before max.".
 - **Max. compressor pause** (default 180 min, 0 = off): if the compressor stays
   off this long with the shift below normal (shift down) and the room is not
   warmer than the indoor target, the shift returns to normal so the compressor
@@ -72,8 +79,9 @@ section changes the curve shift automatically to lengthen compressor runs:
   running throughout, so a defrost is no extra start, and the lower water
   temperature after it is not taken as a stop until the water has risen again.
 
-At most one step per 5 minutes and 6 commands per hour. A shift changed elsewhere
-(Panasonic app, unit, manual control) pauses tuning. The indoor sensor must be
+At most 6 shift commands per hour and 48 per 24 h (the unit stores them in
+EEPROM). A shift changed elsewhere
+(HeishaMon, unit, manual control) pauses tuning. The indoor sensor must be
 one of the `ha_sensors` (or leave `ha_sensors` empty). Settings, state and log are
 stored in the app's private `/data/tuning.json`.
 
@@ -211,5 +219,13 @@ temperature reported by the unit (checked on every update):
 - **Quiet 0 after a defrost**: after a defrost, quiet stays 0 until the outdoor
   temperature reaches the set value (default 5 °C).
 
-A quiet level changed elsewhere (Panasonic app, unit, the Set button) pauses the
-automatic mode. At most 10 commands per hour.
+A quiet level changed elsewhere (HeishaMon, unit, the Set button) pauses the
+automatic mode. At most 10 commands per hour and 24 per 24 h.
+
+### Thermo off and restart
+
+The tuning section shows the thermo off timer (since, expected off, step time)
+and the restart rule learned from the last 20 restarts: the water outlet at
+restart relative to the target or to the inlet at stop − 3 K, whichever is
+more consistent, with an expected restart time once it is reliable (at least
+5 restarts, spread ≤ 0.5 K). Stops not explained by the timer are logged.

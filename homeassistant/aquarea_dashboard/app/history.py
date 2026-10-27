@@ -21,6 +21,12 @@ FIELDS = [
     "zone1_heat_shift",
     "energy_today_kwh",
     "source",
+    "compressor_freq",
+    "inlet_temperature",
+    "pump_flow",
+    "power_in_w",
+    "power_out_w",
+    "heat_today_kwh",
 ]
 NUMERIC_FIELDS = {
     "outdoor_temperature",
@@ -28,6 +34,12 @@ NUMERIC_FIELDS = {
     "zone1_target_temperature",
     "zone1_heat_shift",
     "energy_today_kwh",
+    "compressor_freq",
+    "inlet_temperature",
+    "pump_flow",
+    "power_in_w",
+    "power_out_w",
+    "heat_today_kwh",
 }
 # Home Assistant sensors are stored in extra columns named "ha:<entity_id>".
 HA_PREFIX = "ha:"
@@ -51,7 +63,7 @@ def _usable(block: Any) -> dict | None:
 
 
 def extract_rows(report: dict[str, Any]) -> list[dict[str, Any]]:
-    """One row per device, from live status or (fallback) the raw device list."""
+    """One row per device with a live status (HeishaMon data)."""
     rows = []
     ha_values = {
         f"{HA_PREFIX}{s['entity_id']}": s.get("value")
@@ -60,59 +72,36 @@ def extract_rows(report: dict[str, Any]) -> list[dict[str, Any]]:
     }
     for dev in report.get("devices", []):
         info = dev.get("info", {})
+        status = _usable(dev.get("status"))
+        if not status:
+            continue
+        zones = status.get("zones") or []
+        zone1 = next((z for z in zones if z.get("zone_id") == 1), {})
+        zone0 = zones[0] if zones and isinstance(zones[0], dict) else {}
+        extra = dev.get("status_extra") or {}
+        live = dev.get("heishamon") or {}
+        today = (dev.get("energy") or {}).get("today") or {}
         row = {
             "timestamp": report["generated_at"],
             "device_id": info.get("device_id"),
             "device_name": info.get("name"),
+            "operation_status": _enum_name(zone0.get("operation_status")),
+            "pump_duty": _enum_name(status.get("pump_duty")),
+            "direction": _enum_name(status.get("direction")),
+            "defrost": _on_off(extra.get("defrost")),
+            "outdoor_temperature": status.get("temperature_outdoor"),
+            "zone1_water_temperature": zone1.get("temperature"),
+            "zone1_target_temperature": (dev.get("water_target") or {}).get("target"),
+            "zone1_heat_shift": (dev.get("water_target") or {}).get("shift"),
+            "energy_today_kwh": today.get("kwh_in"),
+            "source": "heishamon",
+            "compressor_freq": live.get("compressor_freq"),
+            "inlet_temperature": live.get("inlet"),
+            "pump_flow": live.get("flow"),
+            "power_in_w": live.get("power_in_w"),
+            "power_out_w": live.get("power_out_w"),
+            "heat_today_kwh": today.get("kwh_out"),
         }
-        status = _usable(dev.get("status"))
-        raw = _usable(dev.get("raw_device_list_entry"))
-        if status:
-            zones = status.get("zones") or []
-            zone1 = next((z for z in zones if z.get("zone_id") == 1), {})
-            zone0 = zones[0] if zones and isinstance(zones[0], dict) else {}
-            extra = dev.get("status_extra") or {}
-            defrost = _on_off(extra.get("defrost"))
-            if defrost is None:
-                mode_status = _enum_name(status.get("device_status"))
-                defrost = {"DEFROST": "ON", "NORMAL": "OFF"}.get(mode_status)
-            row |= {
-                "operation_status": _enum_name(zone0.get("operation_status")),
-                "pump_duty": _enum_name(status.get("pump_duty")),
-                "direction": _enum_name(status.get("direction")),
-                "defrost": defrost,
-                "outdoor_temperature": status.get("temperature_outdoor"),
-                "zone1_water_temperature": zone1.get("temperature"),
-                "zone1_target_temperature": (dev.get("water_target") or {}).get("target"),
-                "zone1_heat_shift": (dev.get("water_target") or {}).get("shift"),
-                "source": "status",
-            }
-        elif raw:
-            zones = raw.get("zoneStatus") or []
-            zone1 = next((z for z in zones if isinstance(z, dict) and z.get("zoneId") == 1), {})
-            zone0 = zones[0] if zones and isinstance(zones[0], dict) else {}
-            row |= {
-                "operation_status": _on_off(zone0.get("operationStatus")),
-                "pump_duty": _on_off(raw.get("pumpDuty")),
-                "outdoor_temperature": raw.get("outdoorNow"),
-                "zone1_water_temperature": zone1.get("temperatureNow"),
-                "source": "device_list",
-            }
-        else:
-            continue
-        if row["outdoor_temperature"] is None:
-            # Fallback: latest hourly outdoor value from today's energy data
-            items = (dev.get("consumption") or {}).get("day", {}).get("items") or []
-            temps = [i.get("outdoor_temp") for i in items if isinstance(i.get("outdoor_temp"), (int, float))]
-            if temps:
-                row["outdoor_temperature"] = temps[-1]
-        day = (dev.get("consumption") or {}).get("day") or {}
-        items = day.get("items") or []
-        if items and not day.get("error"):
-            # Sum of today's hourly values; the cloud updates it in steps (~15 min)
-            row["energy_today_kwh"] = round(
-                sum(v for i in items if isinstance(v := i.get("total_consumption"), (int, float))), 3
-            )
         row |= ha_values
         rows.append(row)
     return rows

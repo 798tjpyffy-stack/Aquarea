@@ -1,7 +1,7 @@
 name: Aquarea Dashboard
-version: "0.1.60"
+version: "0.2.0"
 slug: aquarea_dashboard
-description: Panasonic Aquarea heat pump dashboard with history logging and optional heating control
+description: Panasonic Aquarea heat pump dashboard (HeishaMon over MQTT) with history logging and optional heating control
 arch:
   - aarch64
   - amd64
@@ -14,6 +14,8 @@ panel_icon: mdi:heat-pump
 panel_title: Aquarea
 panel_admin: true
 homeassistant_api: true
+services:
+  - mqtt:need
 map:
   - type: app_config
     read_only: false
@@ -22,11 +24,11 @@ options:
   allow_control: false
   debug: false
   ha_sensors: []
-  heat_curve: "5:30,-7:34"
+  mqtt_base_topic: panasonic_heat_pump
 schema:
   poll_minutes: int(1,1440)
   allow_control: bool
   debug: bool
   ha_sensors:
     - match(^sensor\.[a-z0-9_]+$)
-  heat_curve: str?
+  mqtt_base_topic: match(^[A-Za-z0-9_\-]+(/[A-Za-z0-9_\-]+)*$)

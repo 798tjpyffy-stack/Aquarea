@@ -1,146 +1,71 @@
-"""Local web UI for the Aquarea read-only reporter.
+"""Local web UI for the Aquarea heat pump, live data and commands through HeishaMon (MQTT).
 
-Run:  python web.py            -> http://127.0.0.1:8080
+Run:  python web.py --mqtt-host <broker>   -> http://127.0.0.1:8080
+MQTT user and password are read from $MQTT_USER / $MQTT_PASSWORD (or a .env file).
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import csv
 import datetime as dt
 import hashlib
 import ipaddress
 import logging
 import os
-import secrets
-from dataclasses import dataclass, field
+import time
 from pathlib import Path
 from typing import Any
 
 import aiohttp
 from aiohttp import web
-
-from aioaquarea import (
-    ApiError,
-    AuthenticationError,
-    Client,
-    ClientError,
-)
-from aioaquarea.data import OperationStatus, QuietMode, UpdateOperationMode, ZoneTemperatureSetUpdate
-from aioaquarea.errors import AuthenticationErrorCodes
+from dotenv import load_dotenv
 
 import compressor
 import cooling
 import forecast
+import heishamon
 import quiet
 import tuning
-from aquarea_report import CONSUMPTION_PERIODS, build_report, parse_heat_curve, raw_device_list_entry, water_target
+from energy import EnergyMeter
 from forecast import Forecast, parse_location
 from ha_sensors import HAConfig, fetch_sensors
+from heishamon import CommandError, HeishaMon, MqttConfig
 from history import append_rows, count_rising_edges, extract_rows, read_rows
-from token_store import PersistentClient, TokenStore
+from thermo import THERMO_S, ThermoWatch
 
 _LOGGER = logging.getLogger("aquarea_web")
 
 STATIC_DIR = Path(__file__).parent / "static"
-COOKIE_NAME = "aq_session"
-COOKIE_MAX_AGE = 30 * 24 * 3600  # seconds
-MAX_FIELD_LENGTH = 256
 ALLOW_CONTROL = web.AppKey("allow_control", bool)
 POLL_MINUTES = web.AppKey("poll_minutes", int)
 HISTORY_FILE = web.AppKey("history_file", Path)
-TOKEN_STORE = web.AppKey("token_store", TokenStore)
 ALLOWED_IPS = web.AppKey("allowed_ips", frozenset)
-SHARED_SESSION = web.AppKey("shared_session", bool)
 HA_CONFIG = web.AppKey("ha_config", object)  # HAConfig | None
 HA_HTTP = web.AppKey("ha_http", aiohttp.ClientSession)
-HEAT_CURVE = web.AppKey("heat_curve", object)  # list[(outdoor, water)] | None
 TUNER = web.AppKey("tuner", tuning.Tuner)
 COOLING = web.AppKey("cooling", cooling.CoolingStore)
 FORECAST = web.AppKey("forecast", Forecast)
 FORECAST_HTTP = web.AppKey("forecast_http", aiohttp.ClientSession)
+HEISHAMON = web.AppKey("heishamon", HeishaMon)
+ENERGY = web.AppKey("energy", EnergyMeter)
+THERMO = web.AppKey("thermo", ThermoWatch)
+DEVICE = web.AppKey("device", tuple)  # (device_id, name)
+STATE = web.AppKey("state", dict)  # last_report, tasks
+CONTROL_LOCK = web.AppKey("control_lock", asyncio.Lock)
 
-# aioaquarea keeps device zones in a class-level dict, so reports must not be
-# built concurrently (even across different user sessions).
-REPORT_LOCK = asyncio.Lock()
-# Scheduled polls fetch the live status every time but save cloud requests
-# (rate limit) elsewhere: the device list is refreshed hourly; today's energy
-# (updated by the cloud about every 15 min) every DAY_ENERGY_MAX_AGE, but on
-# every poll while a compressor start is possible (unit on, compressor not
-# running), as half the starts are only seen in the average power; month/year
-# totals hourly.
-DEVICES_MAX_AGE = dt.timedelta(hours=1)
-DAY_ENERGY_MAX_AGE = dt.timedelta(minutes=5)
-CONSUMPTION_MAX_AGE = dt.timedelta(hours=1)
-# While the unit is switched off nothing can start on its own: poll every
-# OFF_POLL_MINUTES (and today's energy every DAY_ENERGY_OFF_MAX_AGE), but wake up
-# for the night-time shutoff's times (night start/end, gate, early off end) and
-# poll at the normal interval for FAST_AFTER_COMMAND after a power command.
-OFF_POLL_MINUTES = 5
-DAY_ENERGY_OFF_MAX_AGE = dt.timedelta(minutes=15)
-FAST_AFTER_COMMAND = dt.timedelta(minutes=10)
+FIRST_POLL_S = 10  # after start: time for HeishaMon to publish its values
+TICK_S = 10  # energy integration / save
+FAST_S = 2  # thermo off timer and resend checks
+FAST_RETRY_S = 10  # repeat a due step check at most this often
+RESEND_CHECK_S = 15
+DEFAULT_DEVICE_ID = "heishamon"
 
 
 def history_gap(poll_minutes: int) -> dt.timedelta:
     """Longest distance between history rows that still counts as continuous."""
-    return dt.timedelta(minutes=max(3 * poll_minutes, 2 * OFF_POLL_MINUTES))
-
-
-@dataclass
-class UserSession:
-    client: PersistentClient
-    http: aiohttp.ClientSession
-    session_hash: str = ""
-    last_report: dict[str, Any] | None = None
-    poll_task: asyncio.Task | None = None
-    consumption_at: dt.datetime | None = None  # month/year totals
-    day_energy_at: dt.datetime | None = None
-    devices_at: dt.datetime | None = None
-    # a compressor start is possible: fetch today's energy on every poll
-    energy_fast: bool = True
-    # every device reports its zones off: poll slowly
-    unit_off: bool = False
-    fast_until: dt.datetime | None = None
-    wake: asyncio.Event = field(default_factory=asyncio.Event)
-
-    async def close(self) -> None:
-        if self.poll_task:
-            self.poll_task.cancel()
-        await self.http.close()
-
-
-# Sessions live until logout and are restored from the token store on restart,
-# so background polling keeps logging history while no browser is open.
-# Keyed by SHA-256 of the cookie value (the raw cookie is never stored).
-SESSIONS: dict[str, UserSession] = {}
-
-
-def _hash(cookie: str) -> str:
-    return hashlib.sha256(cookie.encode()).hexdigest()
-
-
-def _get_session(request: web.Request) -> UserSession | None:
-    if request.app[SHARED_SESSION]:
-        # Access is already authenticated upstream (e.g. HA ingress), so every
-        # client uses the one Aquarea login regardless of its cookie.
-        return next(iter(SESSIONS.values()), None)
-    token = request.cookies.get(COOKIE_NAME)
-    return SESSIONS.get(_hash(token)) if token else None
-
-
-def _persist(app: web.Application, session: UserSession) -> None:
-    try:
-        app[TOKEN_STORE].save(
-            session.client.username, {**session.client.export_token(), "session_hash": session.session_hash}
-        )
-    except OSError as ex:
-        _LOGGER.error("Could not store token: %s", ex)
-
-
-def _start_session(app: web.Application, session: UserSession, poll_now: bool = False) -> None:
-    session.client.on_token = lambda: _persist(app, session)
-    session.poll_task = asyncio.create_task(poll_loop(app, session, poll_now))
-    SESSIONS[session.session_hash] = session
+    return dt.timedelta(minutes=max(3 * poll_minutes, 10))
 
 
 def _require_json(request: web.Request) -> None:
@@ -150,128 +75,14 @@ def _require_json(request: web.Request) -> None:
         raise web.HTTPUnsupportedMediaType(text="Expected application/json")
 
 
-async def refresh_report(
-    app: web.Application, session: UserSession, include_consumption: bool = True, scheduled: bool = False
-) -> dict[str, Any]:
-    """Fetch a fresh report, cache it on the session and append to the CSV history.
-
-    Scheduled polls only fetch what is due (see DEVICES_MAX_AGE and below) and
-    carry the other energy data over from the last report; other reports fetch
-    everything.
-    """
-    now = dt.datetime.now(dt.timezone.utc)
-
-    def fresh(at: dt.datetime | None, max_age: dt.timedelta) -> bool:
-        return at is not None and now - at < max_age
-
-    reuse = include_consumption and scheduled and session.last_report is not None
-    if not include_consumption:
-        periods: tuple[str, ...] = ()
-    elif not reuse:
-        periods = CONSUMPTION_PERIODS
-    else:
-        same_day = (
-            session.day_energy_at is not None
-            and session.day_energy_at.astimezone().date() == now.astimezone().date()
-        )
-        day_age = DAY_ENERGY_OFF_MAX_AGE if session.unit_off else DAY_ENERGY_MAX_AGE
-        day_due = session.energy_fast or not same_day or not fresh(session.day_energy_at, day_age)
-        periods = (("day",) if day_due else ()) + (
-            () if fresh(session.consumption_at, CONSUMPTION_MAX_AGE) else ("month", "year")
-        )
-    refresh_devices = not scheduled or not fresh(session.devices_at, DEVICES_MAX_AGE)
-    async with REPORT_LOCK:
-        await session.client.ensure_token()
-        try:
-            report = await build_report(session.client, bool(periods), periods, refresh_devices)
-        except AuthenticationError as ex:
-            if ex.error_code == AuthenticationErrorCodes.INVALID_USERNAME_OR_PASSWORD:
-                raise
-            # Token rejected early (e.g. another login on this account): renew once.
-            _LOGGER.info("Token rejected (%s), renewing", ex)
-            await session.client.login()
-            report = await build_report(session.client, bool(periods), periods, True)
-            refresh_devices = True
-    if refresh_devices:
-        session.devices_at = now
-    if "day" in periods:
-        session.day_energy_at = now
-    if "month" in periods:
-        session.consumption_at = now
-    if not include_consumption:
-        # report without energy data: fetch it on the next poll
-        session.consumption_at = session.day_energy_at = None
-    elif reuse:
-        previous = {d.get("info", {}).get("device_id"): d for d in session.last_report.get("devices", [])}
-        for dev in report["devices"]:
-            old = (previous.get(dev.get("info", {}).get("device_id"), {}).get("consumption")) or {}
-            for key in CONSUMPTION_PERIODS:
-                if key in old and key not in (dev.get("consumption") or {}):
-                    dev.setdefault("consumption", {})[key] = old[key]
-    if app[HA_CONFIG] is not None:
-        report["ha_sensors"] = await fetch_sensors(app[HA_HTTP], app[HA_CONFIG])
-    await app[FORECAST].refresh(app[FORECAST_HTTP], app[HA_CONFIG])
-    for dev in report["devices"]:
-        dev["water_target"] = water_target(dev.get("status"), app[HEAT_CURVE])
-    session.last_report = report
-    was_off = session.unit_off
-    session.unit_off = bool(report["devices"]) and all(
-        isinstance(d.get("status"), dict) and "error" not in d["status"] and not _zones_on(d["status"])
-        for d in report["devices"]
-    )
-    if was_off and not session.unit_off:
-        session.wake.set()  # switched on elsewhere: end a slow poll pause
-    energy_fast = False
-    try:
-        append_rows(app[HISTORY_FILE], extract_rows(report))
-        midnight = dt.datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
-        # at least 12 h back, so that "off since" also covers the night
-        read_from = min(midnight, dt.datetime.now().astimezone() - dt.timedelta(hours=12)) - compressor.CONTEXT
-        for dev in report["devices"]:
-            device_id = dev.get("info", {}).get("device_id")
-            rows = read_rows(app[HISTORY_FILE], read_from, device_id)
-            today = [r for r in rows if dt.datetime.fromisoformat(r["timestamp"]) >= midnight]
-            dev["defrost_cycles_today"] = count_rising_edges(today, "defrost")
-            estimated = compressor.estimate(rows)
-            dev["compressor_today"] = compressor.daily_stats(estimated, midnight, history_gap(app[POLL_MINUTES]))
-            latest = estimated[-1] if estimated else {}
-            running = latest.get("timestamp") == report["generated_at"] and latest.get("compressor") == "ON"
-            status = dev.get("status")
-            known = isinstance(status, dict) and "error" not in status
-            if (not known or _zones_on(status)) and not running:
-                energy_fast = True
-    except OSError as ex:
-        energy_fast = True
-        _LOGGER.error("Could not write history: %s", ex)
-    session.energy_fast = energy_fast
-    for dev in report["devices"]:
-        device_id = dev.get("info", {}).get("device_id")
-        if device_id:
-            store = app[COOLING]
-            local_now = dt.datetime.now().astimezone()
-            if store.due(device_id, local_now):
-                sensor = app[TUNER].entry(device_id)["settings"]["indoor_sensor"]
-                try:
-                    await asyncio.to_thread(store.update, device_id, app[HISTORY_FILE], sensor, local_now)
-                except Exception:  # noqa: BLE001 - learning must never break the report
-                    _LOGGER.exception("Cooling update failed for %s", device_id)
-            try:
-                await run_tuning(app, session, report, dev)
-            except Exception:  # noqa: BLE001 - tuning must never break the report
-                _LOGGER.exception("Tuning failed for %s", device_id)
-            dev["tuning"] = _tuning_public(app, device_id)
-            dev["quiet_auto"] = app[TUNER].public_quiet(device_id)
-    return report
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
-def _tuning_public(app: web.Application, device_id: str) -> dict[str, Any]:
-    return {**app[TUNER].public(device_id), "cooling": app[COOLING].public(device_id)}
-
-
-def _zones_on(status: dict[str, Any]) -> bool:
-    """The operation mode stays e.g. HEAT when the unit is switched off; the zones go
-    OFF (same source as the "Operation" tile and the history)."""
-    return any((z.get("operation_status") or {}).get("name") == "ON" for z in status.get("zones") or [])
+def _strict_int(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
 
 
 def _whole(value: Any) -> int | None:
@@ -280,17 +91,91 @@ def _whole(value: Any) -> int | None:
     return _strict_int(value)
 
 
+def _running(app: web.Application) -> bool:
+    freq = app[HEISHAMON].num(heishamon.FREQ)
+    return freq is not None and freq > 0
+
+
+def _step_lead(app: web.Application) -> int:
+    return app[TUNER].entry(app[DEVICE][0])["settings"]["step_lead_s"]
+
+
+# --------------------------------------------------------------------------- #
+# Report
+# --------------------------------------------------------------------------- #
+def build_report(app: web.Application) -> dict[str, Any]:
+    """The current HeishaMon values in the dashboard's report shape (no network request)."""
+    now = time.time()
+    dev = app[HEISHAMON].device_report(*app[DEVICE])
+    dev["energy"] = app[ENERGY].public(now, _running(app))
+    dev["thermo"] = app[THERMO].public(now, _step_lead(app))
+    return {
+        "generated_at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+        "devices": [dev],
+    }
+
+
+async def refresh_report(app: web.Application) -> dict[str, Any]:
+    """Build a report, append it to the CSV history (while HeishaMon is online) and run
+    the automatic control."""
+    report = build_report(app)
+    if app[HA_CONFIG] is not None:
+        report["ha_sensors"] = await fetch_sensors(app[HA_HTTP], app[HA_CONFIG])
+    await app[FORECAST].refresh(app[FORECAST_HTTP], app[HA_CONFIG])
+    dev = report["devices"][0]
+    device_id = dev["info"]["device_id"]
+    try:
+        if dev["heishamon"]["online"]:
+            append_rows(app[HISTORY_FILE], extract_rows(report))
+        now = dt.datetime.now().astimezone()
+        midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        # at least 12 h back, so that "off since" also covers the night
+        read_from = min(midnight, now - dt.timedelta(hours=12)) - compressor.CONTEXT
+        rows = read_rows(app[HISTORY_FILE], read_from, device_id)
+        today = [r for r in rows if dt.datetime.fromisoformat(r["timestamp"]) >= midnight]
+        dev["defrost_cycles_today"] = count_rising_edges(today, "defrost")
+        estimated = compressor.estimate(rows)
+        dev["compressor_today"] = compressor.daily_stats(estimated, midnight, history_gap(app[POLL_MINUTES]))
+    except OSError as ex:
+        _LOGGER.error("Could not read/write history: %s", ex)
+    store = app[COOLING]
+    local_now = dt.datetime.now().astimezone()
+    if store.due(device_id, local_now):
+        sensor = app[TUNER].entry(device_id)["settings"]["indoor_sensor"]
+        try:
+            await asyncio.to_thread(store.update, device_id, app[HISTORY_FILE], sensor, local_now)
+        except Exception:  # noqa: BLE001 - learning must never break the report
+            _LOGGER.exception("Cooling update failed for %s", device_id)
+    try:
+        async with app[CONTROL_LOCK]:
+            await run_tuning(app, report, dev)
+    except Exception:  # noqa: BLE001 - tuning must never break the report
+        _LOGGER.exception("Tuning failed for %s", device_id)
+    dev["tuning"] = _tuning_public(app, device_id)
+    dev["quiet_auto"] = app[TUNER].public_quiet(device_id)
+    app[STATE]["last_report"] = report
+    return report
+
+
+def _tuning_public(app: web.Application, device_id: str) -> dict[str, Any]:
+    return {**app[TUNER].public(device_id), "cooling": app[COOLING].public(device_id)}
+
+
+def _zones_on(status: dict[str, Any]) -> bool:
+    return any((z.get("operation_status") or {}).get("name") == "ON" for z in status.get("zones") or [])
+
+
 def _observe(app: web.Application, report: dict[str, Any], dev: dict[str, Any]) -> tuning.Observation:
-    """What the tuner needs from a fresh report and the history."""
+    """What the tuner needs from a report and the history."""
     device_id = dev["info"]["device_id"]
     settings = app[TUNER].entry(device_id)["settings"]
-    status = dev.get("status") if isinstance(dev.get("status"), dict) and "error" not in dev["status"] else {}
+    online = bool((dev.get("heishamon") or {}).get("online"))
+    status = dev.get("status") if online and isinstance(dev.get("status"), dict) and "error" not in dev["status"] else {}
     zone1 = next((z for z in status.get("zones") or [] if z.get("zone_id") == 1), {})
     lo, hi = _whole(zone1.get("heat_min")), _whole(zone1.get("heat_max"))
-    wt = dev.get("water_target") or {}
+    wt = (dev.get("water_target") or {}) if status else {}
     now = dt.datetime.now().astimezone()
     rows = compressor.estimate(read_rows(app[HISTORY_FILE], now - tuning.HISTORY_WINDOW, device_id))
-    latest = rows[-1] if rows else {}
     sensor = next(
         (
             s
@@ -306,208 +191,182 @@ def _observe(app: web.Application, report: dict[str, Any], dev: dict[str, Any]) 
     outdoor_path = cooling.outdoor_path(now, outdoor, fc.hourly if fresh else []) if outdoor is not None else None
     extra = dev.get("status_extra") or {}
     direction = (status.get("direction") or {}).get("name") if isinstance(status.get("direction"), dict) else None
-    zones_on = _zones_on(status)
-    current = latest.get("timestamp") == report["generated_at"]  # history write may have failed
-    comp_state = compressor.state_of(rows) if current else {}
-    comp_since = dt.datetime.fromisoformat(comp_state["since"]) if comp_state.get("since") else None
-    comp_now = latest.get("compressor") if current else None
-    water_reached, water_degree_min = tuning.water_rise(
-        [
-            (dt.datetime.fromisoformat(r["timestamp"]), r["zone1_water_temperature"])
-            for r in rows
-            if _is_number(r.get("zone1_water_temperature"))
-        ],
-        comp_since if comp_now == "ON" else None,
-    )
+    # compressor state from the measured frequency; since: the live edge, else the history
+    freq = dev["heishamon"].get("compressor_freq") if status else None
+    comp_now = None if not _is_number(freq) else "ON" if freq > 0 else "OFF"
+    comp_since = None
+    if comp_now is not None:
+        watch = app[THERMO]
+        if watch.running_since is not None and watch.running == (comp_now == "ON"):
+            comp_since = dt.datetime.fromtimestamp(watch.running_since).astimezone()
+        else:
+            state = compressor.state_of(rows)
+            comp_since = (
+                dt.datetime.fromisoformat(state["since"]) if state.get("state") == comp_now and state.get("since") else now
+            )
+    over_since = app[THERMO].over_since
+    defrost = extra.get("defrost") == 1
+    water = zone1.get("temperature")
     return tuning.Observation(
         now=now,
         control=app[ALLOW_CONTROL],
-        unit_on=bool(status) and (status.get("operation_mode") or {}).get("name") not in (None, "OFF") and zones_on,
+        unit_on=bool(status) and _zones_on(status),
         operation_on=(zone1.get("operation_status") or {}).get("name") == "ON",
         curve_mode=wt.get("curve") is not None,
         shift=_whole(wt.get("shift")) if wt.get("curve") is not None else None,
         limits=(lo, hi) if lo is not None and hi is not None else None,
-        water=zone1.get("temperature") if isinstance(zone1.get("temperature"), (int, float)) else None,
-        target=wt.get("target") if isinstance(wt.get("target"), (int, float)) else None,
-        indoor=indoor if isinstance(indoor, (int, float)) and not isinstance(indoor, bool) else None,
+        water=water if _is_number(water) else None,
+        target=wt.get("target") if _is_number(wt.get("target")) else None,
+        indoor=indoor if _is_number(indoor) else None,
         outdoor=outdoor,
-        # only the row of this report counts (history write may have failed)
         compressor=comp_now,
         compressor_since=comp_since,
-        heating=direction != "WATER" and extra.get("defrost") != 1,
+        heating=direction != "WATER" and not defrost,
         status_ok=bool(status),
-        defrost=extra.get("defrost") == 1,
+        defrost=defrost,
         quiet=_strict_int((status.get("quiet_mode") or {}).get("value")) if isinstance(status.get("quiet_mode"), dict) else None,
-        hold_until=compressor.defrost_hold_until(rows, now, extra.get("defrost") == 1),
+        hold_until=compressor.defrost_hold_until(rows, now, defrost),
         cooling=app[COOLING].model(device_id),
         outdoor_path=outdoor_path,
-        water_reached=water_reached,
-        water_degree_min=water_degree_min,
+        thermo_since=dt.datetime.fromtimestamp(over_since).astimezone() if over_since is not None else None,
     )
 
 
-def _is_number(value: Any) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+# --------------------------------------------------------------------------- #
+# Automatic control (call with CONTROL_LOCK held)
+# --------------------------------------------------------------------------- #
+async def _send(app: web.Application, command: str, value: int, why: str) -> str | None:
+    """Publish a command; the error text if it failed."""
+    _LOGGER.warning("CONTROL: %s -> %s (%s)", command, value, why)
+    try:
+        await app[HEISHAMON].send(command, value)
+    except CommandError as ex:
+        _LOGGER.warning("Command %s %s failed: %s", command, value, ex)
+        return str(ex) or type(ex).__name__
+    return None
 
 
-class ControlError(Exception):
-    def __init__(self, message: str, status: int):
-        super().__init__(message)
-        self.status = status
-
-
-async def _send_power(client: Client, device_id: str, on: bool, why: str) -> None:
-    """Heating on (HEAT, all zones on) or the whole unit off; call with REPORT_LOCK held."""
-    client._device_manager._devices = None  # noqa: SLF001 - force fresh device list
-    info = next((d for d in await client.get_devices() if d.device_id == device_id), None)
-    if info is None:
-        raise ControlError("Unknown device", 404)
-    status = await client.get_device_status(info)
-    zones = [z for z in status.zones if z.zone_id is not None and z.operation_status is not None]
-    if not zones:
-        raise ControlError("No zones in the live status; refusing to send.", 409)
-    zone_state = OperationStatus.ON if on else OperationStatus.OFF
-    tank = status.tank_status[0].operation_status if status.tank_status else OperationStatus.OFF
-    _LOGGER.warning("CONTROL %s: device %s heating -> %s (%s)", client.username, device_id, zone_state.name, why)
-    await client.post_device_operation_update(
-        info.long_id,
-        UpdateOperationMode.HEAT if on else UpdateOperationMode.OFF,
-        {z.zone_id: zone_state for z in zones},
-        OperationStatus.ON if on or tank == OperationStatus.ON else OperationStatus.OFF,
-        tank,
-        # Resend the current setpoints, as the official app does
-        [ZoneTemperatureSetUpdate(zone_id=z.zone_id, heat_set=z.heat_set, cool_set=z.cool_set) for z in zones],
-    )
-
-
-async def run_night_off(app: web.Application, session: UserSession, dev: dict[str, Any], obs: tuning.Observation) -> bool:
+async def run_night_off(app: web.Application, device_id: str, obs: tuning.Observation) -> bool:
     """Night-time shutoff; True if a power command was sent."""
-    device_id = dev["info"]["device_id"]
     tuner = app[TUNER]
     window = tuning.night_window(tuner.entry(device_id)["settings"], obs.now)
     cmd = tuner.evaluate_night_off(device_id, obs, app[FORECAST].summary(window))
     if cmd is None:
         return False
-    error = None
-    try:
-        async with REPORT_LOCK:
-            await session.client.ensure_token()
-            await _send_power(session.client, device_id, cmd.on, f"night-time shutoff: {cmd.reason}")
-    except (ControlError, AuthenticationError, ApiError, ClientError, aiohttp.ClientError) as ex:
-        error = str(ex) or type(ex).__name__
-        _LOGGER.warning("Night-time shutoff command failed: %s", error)
-    session.fast_until = obs.now + FAST_AFTER_COMMAND
+    error = await _send(app, "SetHeatpump", 1 if cmd.on else 0, f"night-time shutoff: {cmd.reason}")
     tuner.record_power(device_id, cmd, obs.now, error)
     return True
 
 
-async def _send_quiet(client: Client, device_id: str, level: int, why: str) -> None:
-    """Set the quiet mode level; call with REPORT_LOCK held."""
-    client._device_manager._devices = None  # noqa: SLF001 - force fresh device list
-    info = next((d for d in await client.get_devices() if d.device_id == device_id), None)
-    if info is None:
-        raise ControlError("Unknown device", 404)
-    mode = QuietMode(level)
-    _LOGGER.warning("CONTROL %s: device %s quiet mode -> %s (%s)", client.username, device_id, mode.name, why)
-    await client.post_device_set_quiet_mode(info.long_id, mode)
-
-
-async def run_quiet(app: web.Application, session: UserSession, dev: dict[str, Any], obs: tuning.Observation) -> None:
-    device_id = dev["info"]["device_id"]
+async def run_quiet(app: web.Application, device_id: str, obs: tuning.Observation) -> None:
     tuner = app[TUNER]
     cmd = tuner.evaluate_quiet(device_id, obs)
     if cmd is None:
         return
-    error = None
-    try:
-        async with REPORT_LOCK:
-            await session.client.ensure_token()
-            await _send_quiet(session.client, device_id, cmd.level, f"quiet auto: {cmd.reason}")
-    except (ControlError, AuthenticationError, ApiError, ClientError, aiohttp.ClientError) as ex:
-        error = str(ex) or type(ex).__name__
-        _LOGGER.warning("Quiet auto command failed: %s", error)
+    error = await _send(app, "SetQuietMode", cmd.level, f"quiet auto: {cmd.reason}")
     tuner.record_quiet(device_id, cmd, obs.now, error)
 
 
-async def run_tuning(app: web.Application, session: UserSession, report: dict[str, Any], dev: dict[str, Any]) -> None:
-    device_id = dev["info"]["device_id"]
+async def run_shift(app: web.Application, device_id: str, obs: tuning.Observation, force: bool = False) -> None:
     tuner = app[TUNER]
-    obs = _observe(app, report, dev)
-    if await run_night_off(app, session, dev, obs):
-        return  # the unit state changes; tune on the next poll
-    await run_quiet(app, session, dev, obs)
-    cmd = tuner.evaluate(device_id, obs)
+    cmd = tuner.evaluate(device_id, obs, force=force)
     if cmd is None:
         return
-    client = session.client
-    error = None
-    try:
-        async with REPORT_LOCK:
-            await client.ensure_token()
-            limits = await _zone_heat_limits(client, device_id, 1)
-            if limits is None or not limits[0] <= cmd.value <= limits[1]:
-                error = f"allowed range {limits} does not include {cmd.value}"
-            else:
-                _LOGGER.warning(
-                    "CONTROL %s: tuning device %s zone 1 heatSet %s -> %s (%s)",
-                    client.username, device_id, cmd.previous, cmd.value, cmd.reason,
-                )
-                await client.post_device_zone_heat_temperature(device_id, 1, cmd.value)
-    except (AuthenticationError, ApiError, ClientError, aiohttp.ClientError, web.HTTPException) as ex:
-        error = str(ex) or type(ex).__name__
-        _LOGGER.warning("Tuning command failed: %s", error)
+    if obs.limits is None or not obs.limits[0] <= cmd.value <= obs.limits[1]:
+        error = f"allowed range {obs.limits} does not include {cmd.value}"
+    else:
+        error = await _send(app, "SetZ1HeatRequestTemperature", cmd.value, f"tuning from {cmd.previous}: {cmd.reason}")
     tuner.record(device_id, cmd, obs.now, error)
 
 
-def _poll_delay(app: web.Application, session: UserSession) -> float:
-    """Seconds until the next scheduled poll."""
-    normal = app[POLL_MINUTES] * 60
-    now = dt.datetime.now().astimezone()
-    if not session.unit_off or (session.fast_until is not None and now < session.fast_until):
-        return normal
-    delay = max(normal, OFF_POLL_MINUTES * 60)
-    tuner = app[TUNER]
-    for dev in (session.last_report or {}).get("devices", []):
-        device_id = dev.get("info", {}).get("device_id")
-        if device_id:
-            entry = tuner.entry(device_id)
-            for at in tuning.wake_times(entry["settings"], entry["state"], now):
-                # just after the event, but not sooner than the normal interval
-                delay = min(delay, max(normal, (at - now).total_seconds() + 5))
-    return delay
+async def run_tuning(app: web.Application, report: dict[str, Any], dev: dict[str, Any]) -> None:
+    device_id = dev["info"]["device_id"]
+    obs = _observe(app, report, dev)
+    if await run_night_off(app, device_id, obs):
+        return  # the unit state changes; tune on the next poll
+    await run_quiet(app, device_id, obs)
+    await run_shift(app, device_id, obs)
 
 
-async def poll_loop(app: web.Application, session: UserSession, poll_now: bool = False) -> None:
+async def fast_evaluate(app: web.Application) -> None:
+    """Shift tuning only, from the live values (thermo off timer / resend)."""
+    last = app[STATE].get("last_report") or {}
+    report = build_report(app)
+    if "ha_sensors" in last:
+        report["ha_sensors"] = last["ha_sensors"]  # indoor temperature of the last poll
+    dev = report["devices"][0]
+    async with app[CONTROL_LOCK]:
+        await run_shift(app, dev["info"]["device_id"], _observe(app, report, dev), force=True)
+
+
+# --------------------------------------------------------------------------- #
+# Background tasks
+# --------------------------------------------------------------------------- #
+async def poll_loop(app: web.Application) -> None:
+    await asyncio.sleep(FIRST_POLL_S)
     while True:
-        if not poll_now:
-            session.wake.clear()
-            try:
-                await asyncio.wait_for(session.wake.wait(), _poll_delay(app, session))
-            except asyncio.TimeoutError:
-                pass
-            else:
-                # woken from a slow pause (unit switched on): normal interval from now
-                await asyncio.sleep(app[POLL_MINUTES] * 60)
-        poll_now = False
         try:
-            await refresh_report(app, session, scheduled=True)
+            await refresh_report(app)
         except asyncio.CancelledError:
             raise
         except Exception as ex:  # noqa: BLE001 - keep polling on any failure
             _LOGGER.warning("Scheduled update failed: %s", ex)
+        await asyncio.sleep(app[POLL_MINUTES] * 60)
 
 
-def _session_info(request: web.Request, session: UserSession | None) -> dict[str, Any]:
-    expiry = session.client.token_expiration if session else None
-    return {
-        "logged_in": session is not None,
-        "username": session.client.username if session else None,
-        "token_expiration": expiry.isoformat() if expiry else None,
-        "allow_control": request.app[ALLOW_CONTROL],
-        "poll_minutes": request.app[POLL_MINUTES],
-        "off_poll_minutes": max(request.app[POLL_MINUTES], OFF_POLL_MINUTES),
-        "history_gap_minutes": history_gap(request.app[POLL_MINUTES]).total_seconds() / 60,
-    }
+async def tick_loop(app: web.Application) -> None:
+    """Energy integration also between messages (and stopping when they stay away)."""
+    hm, meter = app[HEISHAMON], app[ENERGY]
+    while True:
+        await asyncio.sleep(TICK_S)
+        now = time.time()
+        p_in, p_out = hm.power()
+        meter.update(now, p_in, p_out, hm.fresh(now))
+        meter.maybe_save(now)
+
+
+async def fast_loop(app: web.Application) -> None:
+    """Evaluate the shift at once when a step is due on the thermo off timer, or a
+    command waits for its resend (the regular poll may be a minute away)."""
+    watch, tuner = app[THERMO], app[TUNER]
+    last_try = last_resend = 0.0
+    while True:
+        await asyncio.sleep(FAST_S)
+        try:
+            if app[STATE].get("last_report") is None or not app[ALLOW_CONTROL]:
+                continue
+            device_id = app[DEVICE][0]
+            settings = tuner.entry(device_id)["settings"]
+            now, mono = time.time(), time.monotonic()
+            due = False
+            since = watch.over_since
+            if settings["enabled"] and since is not None:
+                off_at = since + THERMO_S
+                if off_at - settings["step_lead_s"] <= now < off_at + 30 and mono - last_try >= FAST_RETRY_S:
+                    due, last_try = True, mono
+            if not due and mono - last_resend >= RESEND_CHECK_S and tuner.resend_due(
+                device_id, dt.datetime.now().astimezone()
+            ):
+                due, last_resend = True, mono
+            if due:
+                await fast_evaluate(app)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - keep the loop alive
+            _LOGGER.exception("Fast evaluation failed")
+
+
+def _on_message(app: web.Application):
+    hm, meter, watch = app[HEISHAMON], app[ENERGY], app[THERMO]
+
+    def handle(name: str, _value: Any, t: float) -> None:
+        if name in heishamon.POWER_TOPICS:
+            p_in, p_out = hm.power()
+            meter.update(t, p_in, p_out, hm.fresh(t))
+        if name in heishamon.THERMO_TOPICS:
+            watch.update(t, **hm.thermo_values())
+
+    return handle
 
 
 # --------------------------------------------------------------------------- #
@@ -523,97 +382,61 @@ async def index(_: web.Request) -> web.Response:
 
 
 async def api_session(request: web.Request) -> web.Response:
-    return web.json_response(_session_info(request, _get_session(request)))
-
-
-async def api_login(request: web.Request) -> web.Response:
-    _require_json(request)
-    try:
-        body = await request.json()
-    except ValueError:
-        raise web.HTTPBadRequest(text="Invalid JSON")
-    username = str(body.get("username", "")).strip()[:MAX_FIELD_LENGTH]
-    password = str(body.get("password", ""))[:MAX_FIELD_LENGTH]
-    if not username or not password:
-        return web.json_response({"error": "Username and password are required."}, status=400)
-
-    http = aiohttp.ClientSession()
-    client = PersistentClient(http, username, password)
-    try:
-        await client.login()
-    except AuthenticationError:
-        await http.close()
-        return web.json_response({"error": "Login failed. Check username and password."}, status=401)
-    except (ApiError, ClientError, aiohttp.ClientError) as ex:
-        await http.close()
-        _LOGGER.warning("Login error: %s", ex)
-        return web.json_response({"error": "Aquarea cloud not reachable. Try again later."}, status=502)
-
-    # Replace existing sessions of this browser or this account: Panasonic
-    # allows only one active login per account anyway.
-    old = request.cookies.get(COOKIE_NAME)
-    old_hash = _hash(old) if old else None
-    shared = request.app[SHARED_SESSION]
-    for key in [k for k, s in SESSIONS.items() if shared or k == old_hash or s.client.username == username]:
-        await SESSIONS.pop(key).close()
-
-    token = secrets.token_urlsafe(32)
-    session = UserSession(client=client, http=http, session_hash=_hash(token))
-    _start_session(request.app, session)
-    _persist(request.app, session)
-    response = web.json_response(_session_info(request, session))
-    response.set_cookie(
-        COOKIE_NAME,
-        token,
-        httponly=True,
-        samesite="Strict",
-        secure=request.secure,
-        max_age=COOKIE_MAX_AGE,
-        path="/",
+    app = request.app
+    hm = app[HEISHAMON]
+    return web.json_response(
+        {
+            "allow_control": app[ALLOW_CONTROL],
+            "poll_minutes": app[POLL_MINUTES],
+            "history_gap_minutes": history_gap(app[POLL_MINUTES]).total_seconds() / 60,
+            "device_id": app[DEVICE][0],
+            "mqtt": {"host": hm.config.host, "port": hm.config.port, "base_topic": hm.base},
+        }
     )
-    return response
-
-
-async def api_logout(request: web.Request) -> web.Response:
-    _require_json(request)
-    session = _get_session(request)
-    if session is not None:
-        await SESSIONS.pop(session.session_hash).close()
-        try:
-            request.app[TOKEN_STORE].remove(session.client.username)
-        except OSError as ex:
-            _LOGGER.error("Could not remove stored token: %s", ex)
-    response = web.json_response({"logged_in": False})
-    response.del_cookie(COOKIE_NAME, path="/")
-    return response
 
 
 async def api_report(request: web.Request) -> web.Response:
-    session = _get_session(request)
-    if session is None:
-        return web.json_response({"error": "Not logged in."}, status=401)
-    include_consumption = request.query.get("consumption", "1") != "0"
     try:
-        report = await refresh_report(request.app, session, include_consumption)
-    except AuthenticationError:
-        return web.json_response({"error": "Aquarea session expired. Please log in again."}, status=401)
-    except (ApiError, ClientError, aiohttp.ClientError) as ex:
-        _LOGGER.warning("Report error: %s", ex)
-        return web.json_response({"error": f"Aquarea API error: {ex}"}, status=502)
+        report = await refresh_report(request.app)
+    except Exception as ex:  # noqa: BLE001
+        _LOGGER.exception("Report failed")
+        return web.json_response({"error": f"Report failed: {ex}"}, status=500)
     return web.json_response(report)
 
 
 async def api_report_latest(request: web.Request) -> web.Response:
-    """Last report fetched by the background poller (no cloud request)."""
-    session = _get_session(request)
-    if session is None:
-        return web.json_response({"error": "Not logged in."}, status=401)
-    return web.json_response({"report": session.last_report})
+    """Last report of the background poller."""
+    return web.json_response({"report": request.app[STATE].get("last_report")})
+
+
+async def api_live(request: web.Request) -> web.Response:
+    """Live values for the overview (no history write, no control)."""
+    app = request.app
+    hm = app[HEISHAMON]
+    now = time.time()
+    p_in, p_out = hm.power()
+    age = hm.age_s(now)
+    problem = hm.problem()
+    return web.json_response(
+        {
+            "time": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+            "online": problem is None,
+            "problem": problem,
+            "age_s": None if age is None else round(age),
+            "compressor_freq": hm.num(heishamon.FREQ),
+            "outlet": hm.num(heishamon.OUTLET),
+            "inlet": hm.num(heishamon.INLET),
+            "target": hm.num(heishamon.TARGET),
+            "flow": hm.num(heishamon.FLOW),
+            "power_in_w": p_in,
+            "power_out_w": p_out,
+            "energy": {"live": app[ENERGY].live(now, _running(app)), "today": app[ENERGY].today(now)},
+            "thermo": app[THERMO].public(now, _step_lead(app)),
+        }
+    )
 
 
 async def api_history(request: web.Request) -> web.Response:
-    if _get_session(request) is None:
-        return web.json_response({"error": "Not logged in."}, status=401)
     try:
         hours = int(request.query.get("hours", "24"))
     except ValueError:
@@ -633,249 +456,160 @@ async def api_history(request: web.Request) -> web.Response:
     return web.json_response({"rows": rows})
 
 
-def _strict_int(value: object) -> int | None:
-    if isinstance(value, bool) or not isinstance(value, int):
-        return None
-    return value
-
-
-async def _zone_heat_limits(client: Client, device_id: str, zone_id: int) -> tuple[int, int] | None:
-    """Current heat min/max for a zone, from live status or the device list."""
-    client._device_manager._devices = None  # noqa: SLF001 - force fresh device list
-    info = next((d for d in await client.get_devices() if d.device_id == device_id), None)
-    if info is None:
-        raise web.HTTPNotFound(text="Unknown device")
-
-    try:
-        status = await client.get_device_status(info)
-        zone = next((z for z in status.zones if z.zone_id == zone_id), None)
-        if zone and zone.heat_min is not None and zone.heat_max is not None:
-            return zone.heat_min, zone.heat_max
-    except (ApiError, ClientError) as ex:
-        _LOGGER.info("Status unavailable, using device list limits: %s", ex)
-
-    raw = raw_device_list_entry(client, info) or {}
-    for zone in raw.get("zoneStatus") or []:
-        if isinstance(zone, dict) and zone.get("zoneId") == zone_id:
-            lo, hi = _strict_int(zone.get("heatMin")), _strict_int(zone.get("heatMax"))
-            if lo is not None and hi is not None:
-                return lo, hi
-    return None
-
-
-async def api_zone_heat_target(request: web.Request) -> web.Response:
+async def _control_body(request: web.Request) -> tuple[dict[str, Any] | None, web.Response | None]:
+    """The JSON body of a control request for this device, or an error response."""
     if not request.app[ALLOW_CONTROL]:
-        return web.json_response(
+        return None, web.json_response(
             {"error": "Control is disabled. Start the server with --allow-control."}, status=403
         )
     _require_json(request)
-    session = _get_session(request)
-    if session is None:
-        return web.json_response({"error": "Not logged in."}, status=401)
-
-    try:
-        body = await request.json()
-    except ValueError:
-        raise web.HTTPBadRequest(text="Invalid JSON")
-    device_id = body.get("device_id")
-    zone_id = _strict_int(body.get("zone_id"))
-    value = _strict_int(body.get("value"))
-    if not isinstance(device_id, str) or not 0 < len(device_id) <= 64 or zone_id is None or value is None:
-        return web.json_response({"error": "device_id (str), zone_id (int) and value (int) required."}, status=400)
-
-    client = session.client
-    try:
-        async with REPORT_LOCK:
-            await client.ensure_token()
-            limits = await _zone_heat_limits(client, device_id, zone_id)
-            if limits is None:
-                return web.json_response(
-                    {"error": f"Allowed range for zone {zone_id} is unknown; refusing to send."}, status=409
-                )
-            lo, hi = limits
-            if not lo <= value <= hi:
-                return web.json_response({"error": f"Value must be between {lo} and {hi}."}, status=400)
-
-            _LOGGER.warning(
-                "CONTROL %s: device %s zone %s heatSet -> %s", client.username, device_id, zone_id, value
-            )
-            await client.post_device_zone_heat_temperature(device_id, zone_id, value)
-    except AuthenticationError:
-        return web.json_response({"error": "Aquarea session expired. Please log in again."}, status=401)
-    except (ApiError, ClientError, aiohttp.ClientError) as ex:
-        _LOGGER.warning("Control error: %s", ex)
-        return web.json_response({"error": f"Aquarea API error: {ex}"}, status=502)
-
-    return web.json_response({"ok": True, "device_id": device_id, "zone_id": zone_id, "value": value, "range": [lo, hi]})
-
-
-async def api_device_power(request: web.Request) -> web.Response:
-    """Turn heating on (HEAT, all zones on) or off (all zones off)."""
-    if not request.app[ALLOW_CONTROL]:
-        return web.json_response(
-            {"error": "Control is disabled. Start the server with --allow-control."}, status=403
-        )
-    _require_json(request)
-    session = _get_session(request)
-    if session is None:
-        return web.json_response({"error": "Not logged in."}, status=401)
-    try:
-        body = await request.json()
-    except ValueError:
-        raise web.HTTPBadRequest(text="Invalid JSON")
-    device_id, on = body.get("device_id"), body.get("on")
-    if not isinstance(device_id, str) or not 0 < len(device_id) <= 64 or not isinstance(on, bool):
-        return web.json_response({"error": "device_id (str) and on (bool) required."}, status=400)
-
-    client = session.client
-    try:
-        async with REPORT_LOCK:
-            await client.ensure_token()
-            await _send_power(client, device_id, on, "dashboard")
-    except ControlError as ex:
-        return web.json_response({"error": str(ex)}, status=ex.status)
-    except AuthenticationError:
-        return web.json_response({"error": "Aquarea session expired. Please log in again."}, status=401)
-    except (ApiError, ClientError, aiohttp.ClientError) as ex:
-        _LOGGER.warning("Control error: %s", ex)
-        return web.json_response({"error": f"Aquarea API error: {ex}"}, status=502)
-    session.fast_until = dt.datetime.now().astimezone() + FAST_AFTER_COMMAND
-    session.wake.set()
-    return web.json_response({"ok": True, "device_id": device_id, "on": on})
-
-
-async def api_device_quiet_mode(request: web.Request) -> web.Response:
-    """Set the quiet mode level (0 = off, 1–3)."""
-    if not request.app[ALLOW_CONTROL]:
-        return web.json_response(
-            {"error": "Control is disabled. Start the server with --allow-control."}, status=403
-        )
-    _require_json(request)
-    session = _get_session(request)
-    if session is None:
-        return web.json_response({"error": "Not logged in."}, status=401)
-    try:
-        body = await request.json()
-    except ValueError:
-        raise web.HTTPBadRequest(text="Invalid JSON")
-    device_id, level = body.get("device_id"), _strict_int(body.get("level"))
-    if not isinstance(device_id, str) or not 0 < len(device_id) <= 64 or level not in {m.value for m in QuietMode}:
-        return web.json_response({"error": "device_id (str) and level (0–3) required."}, status=400)
-
-    client = session.client
-    try:
-        async with REPORT_LOCK:
-            await client.ensure_token()
-            await _send_quiet(client, device_id, level, "dashboard")
-    except ControlError as ex:
-        return web.json_response({"error": str(ex)}, status=ex.status)
-    except AuthenticationError:
-        return web.json_response({"error": "Aquarea session expired. Please log in again."}, status=401)
-    except (ApiError, ClientError, aiohttp.ClientError) as ex:
-        _LOGGER.warning("Control error: %s", ex)
-        return web.json_response({"error": f"Aquarea API error: {ex}"}, status=502)
-    request.app[TUNER].pause_quiet(device_id, dt.datetime.now().astimezone(), f"set manually to {level}")
-    return web.json_response({"ok": True, "device_id": device_id, "level": level})
-
-
-async def api_quiet_auto(request: web.Request) -> web.Response:
-    """Save quiet auto settings for a device."""
-    if not request.app[ALLOW_CONTROL]:
-        return web.json_response(
-            {"error": "Control is disabled. Start the server with --allow-control."}, status=403
-        )
-    _require_json(request)
-    session = _get_session(request)
-    if session is None:
-        return web.json_response({"error": "Not logged in."}, status=401)
     try:
         body = await request.json()
     except ValueError:
         raise web.HTTPBadRequest(text="Invalid JSON")
     if not isinstance(body, dict):
-        return web.json_response({"error": "JSON object required."}, status=400)
-    device_id = body.get("device_id")
-    known = {d.get("info", {}).get("device_id") for d in (session.last_report or {}).get("devices", [])}
-    if not isinstance(device_id, str) or device_id not in known:
-        return web.json_response({"error": "Unknown device."}, status=404)
+        return None, web.json_response({"error": "JSON object required."}, status=400)
+    if body.get("device_id") != request.app[DEVICE][0]:
+        return None, web.json_response({"error": "Unknown device."}, status=404)
+    return body, None
+
+
+def _live_status(app: web.Application) -> tuple[dict[str, Any] | None, web.Response | None]:
+    hm = app[HEISHAMON]
+    problem = hm.problem()
+    if problem is not None:
+        return None, web.json_response({"error": f"HeishaMon: {problem}; refusing to send."}, status=409)
+    return hm.device_report(*app[DEVICE]), None
+
+
+async def _manual_send(app: web.Application, command: str, value: int) -> web.Response | None:
+    async with app[CONTROL_LOCK]:
+        error = await _send(app, command, value, "dashboard")
+    if error is not None:
+        return web.json_response({"error": f"Command not sent: {error}"}, status=502)
+    return None
+
+
+async def api_zone_heat_target(request: web.Request) -> web.Response:
+    body, error = await _control_body(request)
+    if error:
+        return error
+    zone_id, value = _strict_int(body.get("zone_id")), _strict_int(body.get("value"))
+    if zone_id != 1 or value is None:
+        return web.json_response({"error": "zone_id 1 and value (int) required."}, status=400)
+    dev, error = _live_status(request.app)
+    if error:
+        return error
+    zone = dev["status"]["zones"][0]
+    lo, hi = zone.get("heat_min"), zone.get("heat_max")
+    if lo is None or hi is None:
+        return web.json_response(
+            {"error": "Zone 1 is not in heating curve mode: only the curve shift can be set."}, status=409
+        )
+    if not lo <= value <= hi:
+        return web.json_response({"error": f"Value must be between {lo} and {hi}."}, status=400)
+    result = {"ok": True, "device_id": body["device_id"], "zone_id": 1, "value": value, "range": [lo, hi]}
+    if zone.get("heat_set") == value:
+        return web.json_response({**result, "unchanged": True})
+    if error := await _manual_send(request.app, "SetZ1HeatRequestTemperature", value):
+        return error
+    return web.json_response(result)
+
+
+async def api_device_power(request: web.Request) -> web.Response:
+    """Turn the heat pump on or off."""
+    body, error = await _control_body(request)
+    if error:
+        return error
+    on = body.get("on")
+    if not isinstance(on, bool):
+        return web.json_response({"error": "on (bool) required."}, status=400)
+    dev, error = _live_status(request.app)
+    if error:
+        return error
+    result = {"ok": True, "device_id": body["device_id"], "on": on}
+    if (dev["status"]["operation_status"]["name"] == "ON") == on:
+        return web.json_response({**result, "unchanged": True})
+    if error := await _manual_send(request.app, "SetHeatpump", 1 if on else 0):
+        return error
+    return web.json_response(result)
+
+
+async def api_device_quiet_mode(request: web.Request) -> web.Response:
+    """Set the quiet mode level (0 = off, 1–3)."""
+    body, error = await _control_body(request)
+    if error:
+        return error
+    level = _strict_int(body.get("level"))
+    if level not in (0, 1, 2, 3):
+        return web.json_response({"error": "level (0–3) required."}, status=400)
+    dev, error = _live_status(request.app)
+    if error:
+        return error
+    result = {"ok": True, "device_id": body["device_id"], "level": level}
+    if dev["status"]["quiet_mode"]["value"] == level:
+        return web.json_response({**result, "unchanged": True})
+    if error := await _manual_send(request.app, "SetQuietMode", level):
+        return error
+    request.app[TUNER].pause_quiet(body["device_id"], dt.datetime.now().astimezone(), f"set manually to {level}")
+    return web.json_response(result)
+
+
+async def api_quiet_auto(request: web.Request) -> web.Response:
+    """Save quiet auto settings."""
+    body, error = await _control_body(request)
+    if error:
+        return error
     try:
         settings = quiet.validate_quiet(body.get("settings"))
     except ValueError as ex:
         return web.json_response({"error": str(ex)}, status=400)
-    _LOGGER.warning("CONTROL %s: quiet auto device %s settings %s", session.client.username, device_id, settings)
+    device_id = body["device_id"]
+    _LOGGER.warning("CONTROL: quiet auto device %s settings %s", device_id, settings)
     tuner = request.app[TUNER]
     tuner.update_quiet(device_id, settings, dt.datetime.now().astimezone())
     return web.json_response({"ok": True, "quiet_auto": tuner.public_quiet(device_id)})
 
 
 async def api_tuning(request: web.Request) -> web.Response:
-    """Save hysteresis tuning settings for a device."""
-    if not request.app[ALLOW_CONTROL]:
-        return web.json_response(
-            {"error": "Control is disabled. Start the server with --allow-control."}, status=403
-        )
-    _require_json(request)
-    session = _get_session(request)
-    if session is None:
-        return web.json_response({"error": "Not logged in."}, status=401)
-    try:
-        body = await request.json()
-    except ValueError:
-        raise web.HTTPBadRequest(text="Invalid JSON")
-    if not isinstance(body, dict):
-        return web.json_response({"error": "JSON object required."}, status=400)
-    device_id = body.get("device_id")
-    known = {d.get("info", {}).get("device_id") for d in (session.last_report or {}).get("devices", [])}
-    if not isinstance(device_id, str) or device_id not in known:
-        return web.json_response({"error": "Unknown device."}, status=404)
+    """Save hysteresis tuning settings."""
+    body, error = await _control_body(request)
+    if error:
+        return error
     try:
         settings = tuning.validate_settings(body.get("settings"))
     except ValueError as ex:
         return web.json_response({"error": str(ex)}, status=400)
-    _LOGGER.warning("CONTROL %s: tuning device %s settings %s", session.client.username, device_id, settings)
-    tuner = request.app[TUNER]
-    tuner.update_settings(device_id, settings, dt.datetime.now().astimezone())
+    device_id = body["device_id"]
+    _LOGGER.warning("CONTROL: tuning device %s settings %s", device_id, settings)
+    request.app[TUNER].update_settings(device_id, settings, dt.datetime.now().astimezone())
     return web.json_response({"ok": True, "tuning": _tuning_public(request.app, device_id)})
 
 
 async def api_early_off(request: web.Request) -> web.Response:
     """Start (until the end of the night or for some hours) or end an early off."""
-    if not request.app[ALLOW_CONTROL]:
-        return web.json_response(
-            {"error": "Control is disabled. Start the server with --allow-control."}, status=403
-        )
-    _require_json(request)
-    session = _get_session(request)
-    if session is None:
-        return web.json_response({"error": "Not logged in."}, status=401)
-    try:
-        body = await request.json()
-    except ValueError:
-        raise web.HTTPBadRequest(text="Invalid JSON")
-    if not isinstance(body, dict):
-        return web.json_response({"error": "JSON object required."}, status=400)
-    device_id = body.get("device_id")
-    known = {d.get("info", {}).get("device_id") for d in (session.last_report or {}).get("devices", [])}
-    if not isinstance(device_id, str) or device_id not in known:
-        return web.json_response({"error": "Unknown device."}, status=404)
+    body, error = await _control_body(request)
+    if error:
+        return error
+    device_id = body["device_id"]
     tuner = request.app[TUNER]
     now = dt.datetime.now().astimezone()
     action = body.get("action")
     if action == "cancel":
-        _LOGGER.warning("CONTROL %s: early off device %s ended", session.client.username, device_id)
+        _LOGGER.warning("CONTROL: early off device %s ended", device_id)
         tuner.cancel_early_off(device_id, now)
     elif action == "morning":
         window = tuning.night_window(tuner.entry(device_id)["settings"], now)
         if window is None:
             return web.json_response({"error": "No night hours set: choose a duration."}, status=400)
-        _LOGGER.warning("CONTROL %s: early off device %s until %s", session.client.username, device_id, window[1])
+        _LOGGER.warning("CONTROL: early off device %s until %s", device_id, window[1])
         tuner.start_early_off(device_id, window[1], now)
     elif action == "hours":
         hours = body.get("hours")
         if isinstance(hours, bool) or not isinstance(hours, (int, float)) or not 0.5 <= hours <= 48:
             return web.json_response({"error": "hours must be a number between 0.5 and 48."}, status=400)
         until = now + dt.timedelta(hours=hours)
-        _LOGGER.warning("CONTROL %s: early off device %s until %s", session.client.username, device_id, until)
+        _LOGGER.warning("CONTROL: early off device %s until %s", device_id, until)
         tuner.start_early_off(device_id, until, now)
     else:
         return web.json_response({"error": "action must be morning, hours or cancel."}, status=400)
@@ -913,62 +647,98 @@ async def security_headers(request: web.Request, handler):
     return response
 
 
+def cloud_daily_energy(path: Path, device_id: str) -> dict[str, float]:
+    """Daily consumption (kWh) recorded from the Panasonic cloud before HeishaMon:
+    the highest "today" total per local day."""
+    daily: dict[str, float] = {}
+    for row in read_rows(path, None, device_id):
+        kwh = row.get("energy_today_kwh")
+        if row.get("source") == "heishamon" or not _is_number(kwh):
+            continue
+        day = dt.datetime.fromisoformat(row["timestamp"]).astimezone().date().isoformat()
+        daily[day] = max(daily.get(day, 0.0), kwh)
+    return daily
+
+
 async def on_startup(app: web.Application) -> None:
-    """Restore sessions from stored tokens; the first poll renews them if needed."""
     if app[HA_CONFIG] is not None:
         app[HA_HTTP] = aiohttp.ClientSession()
     app[FORECAST_HTTP] = aiohttp.ClientSession()
-    for username, entry in app[TOKEN_STORE].load().items():
-        session_hash = entry.get("session_hash")
-        if not isinstance(session_hash, str) or not entry.get("refresh_token"):
-            continue
-        http = aiohttp.ClientSession()
-        client = PersistentClient(http, username)
-        client.restore_token(entry)
-        _start_session(app, UserSession(client=client, http=http, session_hash=session_hash), poll_now=True)
-        _LOGGER.warning("Restored session for %s from %s", username, app[TOKEN_STORE].path)
+    hm = app[HEISHAMON]
+    hm.listeners.append(_on_message(app))
+    hm.start()
+    app[STATE]["tasks"] = [
+        asyncio.create_task(poll_loop(app)),
+        asyncio.create_task(tick_loop(app)),
+        asyncio.create_task(fast_loop(app)),
+    ]
+    meter = app[ENERGY]
+    if not meter.seeded:
+        try:
+            daily = await asyncio.to_thread(cloud_daily_energy, app[HISTORY_FILE], app[DEVICE][0])
+            meter.seed(daily, dt.datetime.now().astimezone().date().isoformat())
+            _LOGGER.warning("Energy history: %d days of cloud consumption taken over", len(daily))
+        except Exception:  # noqa: BLE001 - the history is optional
+            _LOGGER.exception("Could not take over the cloud energy history")
 
 
 async def on_shutdown(app: web.Application) -> None:
-    for session in SESSIONS.values():
-        await session.close()
-    SESSIONS.clear()
+    for task in app[STATE].get("tasks") or []:
+        task.cancel()
+    await app[HEISHAMON].stop()
+    app[ENERGY].save()
     if HA_HTTP in app:
         await app[HA_HTTP].close()
     if FORECAST_HTTP in app:
         await app[FORECAST_HTTP].close()
 
 
+def last_device(path: Path) -> tuple[str | None, str | None]:
+    """Device ID and name of the last history row (keeps the history continuous)."""
+    device_id = name = None
+    try:
+        with path.open(newline="", encoding="utf-8") as fh:
+            for row in csv.DictReader(fh):
+                if row.get("device_id"):
+                    device_id, name = row["device_id"], row.get("device_name") or None
+    except OSError:
+        pass
+    return device_id, name
+
+
 def create_app(
+    mqtt: MqttConfig,
     allow_control: bool = False,
     poll_minutes: int = 1,
     history_file: Path = Path("data/history.csv"),
-    token_file: Path = Path("data/tokens.json"),
     allowed_ips: frozenset[str] = frozenset(),
     ha_config: HAConfig | None = None,
-    heat_curve: list[tuple[float, float]] | None = None,
     tuning_file: Path = Path("data/tuning.json"),
     location: tuple[float, float] | None = None,
-    shared_session: bool = False,
+    device_id: str | None = None,
+    device_name: str | None = None,
 ) -> web.Application:
     app = web.Application(middlewares=[client_allowlist, security_headers], client_max_size=16 * 1024)
     app[ALLOW_CONTROL] = allow_control
     app[POLL_MINUTES] = poll_minutes
     app[HISTORY_FILE] = history_file
-    app[TOKEN_STORE] = TokenStore(token_file)
     app[ALLOWED_IPS] = allowed_ips
-    app[SHARED_SESSION] = shared_session
     app[HA_CONFIG] = ha_config
-    app[HEAT_CURVE] = heat_curve
     app[TUNER] = tuning.Tuner(tuning_file)
     app[COOLING] = cooling.CoolingStore(tuning_file.with_name("cooling.json"))
     app[FORECAST] = Forecast(location)
+    app[HEISHAMON] = HeishaMon(mqtt)
+    app[ENERGY] = EnergyMeter(tuning_file.with_name("energy.json"))
+    app[THERMO] = ThermoWatch(tuning_file.with_name("thermo.json"))
+    hist_id, hist_name = last_device(history_file)
+    app[DEVICE] = (device_id or hist_id or DEFAULT_DEVICE_ID, device_name or hist_name or "Heat pump")
+    app[STATE] = {}
+    app[CONTROL_LOCK] = asyncio.Lock()
     app.router.add_get("/", index)
     app.router.add_get("/api/session", api_session)
-    app.router.add_post("/api/login", api_login)
-    app.router.add_post("/api/logout", api_logout)
     app.router.add_get("/api/report", api_report)
     app.router.add_get("/api/report/latest", api_report_latest)
+    app.router.add_get("/api/live", api_live)
     app.router.add_get("/api/history", api_history)
     app.router.add_post("/api/zone/heat-target", api_zone_heat_target)
     app.router.add_post("/api/device/power", api_device_power)
@@ -983,34 +753,40 @@ def create_app(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Aquarea web UI")
+    load_dotenv()
+    parser = argparse.ArgumentParser(description="Aquarea web UI (HeishaMon over MQTT)")
     parser.add_argument("--host", default="127.0.0.1", help="bind address (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--debug", action="store_true")
     parser.add_argument(
         "--allow-control",
         action="store_true",
-        help="enable changing settings (zone heat target); read-only otherwise",
+        help="enable sending commands (shift, power, quiet mode); read-only otherwise",
     )
-    parser.add_argument("--poll-minutes", type=int, default=1, help="auto-update interval (default: 1)")
+    parser.add_argument("--poll-minutes", type=int, default=1, help="history/control interval (default: 1)")
     parser.add_argument(
         "--history-file", type=Path, default=Path("data/history.csv"), help="CSV history file"
     )
     parser.add_argument(
-        "--token-file", type=Path, default=Path("data/tokens.json"), help="stored login tokens (no passwords)"
+        "--mqtt-host", default=os.environ.get("MQTT_HOST") or "localhost", help="MQTT broker (default: $MQTT_HOST)"
     )
+    parser.add_argument(
+        "--mqtt-port", type=int, default=int(os.environ.get("MQTT_PORT") or 1883), help="default: $MQTT_PORT or 1883"
+    )
+    parser.add_argument(
+        "--mqtt-base-topic",
+        default=os.environ.get("MQTT_BASE_TOPIC") or "panasonic_heat_pump",
+        help="HeishaMon's MQTT base topic (default: $MQTT_BASE_TOPIC or panasonic_heat_pump); "
+        "user and password from $MQTT_USER / $MQTT_PASSWORD",
+    )
+    parser.add_argument("--device-id", help="device ID in the history (default: that of the last history row)")
+    parser.add_argument("--device-name", help="device name (default: that of the last history row)")
     parser.add_argument(
         "--allow-ip",
         action="append",
         default=[],
         metavar="IP",
         help="only accept requests from this client IP (repeatable; e.g. 172.30.32.2 for HA ingress)",
-    )
-    parser.add_argument(
-        "--shared-session",
-        action="store_true",
-        help="share one Aquarea login between all clients instead of per browser; "
-        "only use behind an authenticating proxy such as HA ingress",
     )
     parser.add_argument(
         "--ha-url",
@@ -1032,15 +808,11 @@ def main() -> None:
         "default: $HA_SENSORS, comma-separated, or all temperature sensors)",
     )
     parser.add_argument(
-        "--heat-curve",
-        metavar="OUT:WATER,...",
-        help="zone 1 heating curve, outdoor °C : water target °C, e.g. '5:30,-7:34'",
-    )
-    parser.add_argument(
         "--tuning-file",
         type=Path,
         default=Path("data/tuning.json"),
-        help="hysteresis tuning settings, state and log (default: data/tuning.json)",
+        help="hysteresis tuning settings, state and log (default: data/tuning.json); "
+        "energy.json, thermo.json and cooling.json are kept next to it",
     )
     parser.add_argument(
         "--location",
@@ -1051,14 +823,17 @@ def main() -> None:
     args = parser.parse_args()
     if args.poll_minutes < 1:
         parser.error("--poll-minutes must be >= 1")
+    if not 0 < args.mqtt_port < 65536:
+        parser.error("--mqtt-port out of range")
+    base_topic = args.mqtt_base_topic.strip().strip("/")
+    if not heishamon.BASE_TOPIC_RE.match(base_topic):
+        parser.error("--mqtt-base-topic: letters, digits, _ and - separated by / (no wildcards)")
+    if args.device_id is not None and not 0 < len(args.device_id) <= 64:
+        parser.error("--device-id: 1 to 64 characters")
     try:
         location = parse_location(args.location) if args.location else None
     except ValueError as ex:
         parser.error(f"--location: {ex}")
-    try:
-        heat_curve = parse_heat_curve(args.heat_curve) if args.heat_curve else None
-    except ValueError as ex:
-        parser.error(f"--heat-curve: {ex}")
     for ip in args.allow_ip:
         try:
             ipaddress.ip_address(ip)
@@ -1080,31 +855,39 @@ def main() -> None:
         loopback = args.host == "localhost"
     if not loopback and not args.allow_ip:
         _LOGGER.warning(
-            "Binding to %s over plain HTTP: credentials are sent unencrypted. "
-            "Use a TLS reverse proxy for anything beyond localhost.",
+            "Binding to %s over plain HTTP with no authentication: anyone who can reach it can %s. "
+            "Use an authenticating TLS reverse proxy for anything beyond localhost.",
             args.host,
+            "control the heat pump" if args.allow_control else "read the data",
         )
 
+    mqtt = MqttConfig(
+        host=args.mqtt_host,
+        port=args.mqtt_port,
+        username=os.environ.get("MQTT_USER") or None,
+        password=os.environ.get("MQTT_PASSWORD") or None,
+        base_topic=base_topic,
+    )
     mode = "control ENABLED" if args.allow_control else "read-only"
     print(
-        f"Aquarea web UI on http://{args.host}:{args.port} ({mode}, "
-        f"auto-update every {args.poll_minutes} min -> {args.history_file})"
+        f"Aquarea web UI on http://{args.host}:{args.port} ({mode}, HeishaMon via mqtt://{mqtt.host}:{mqtt.port}/"
+        f"{mqtt.base_topic}, history every {args.poll_minutes} min -> {args.history_file})"
     )
     if ha_config:
         which = ", ".join(ha_config.entity_ids) or "all temperature sensors"
         print(f"Home Assistant sensors from {ha_config.url}: {which}")
     web.run_app(
         create_app(
+            mqtt,
             args.allow_control,
             args.poll_minutes,
             args.history_file,
-            args.token_file,
             frozenset(args.allow_ip),
             ha_config,
-            heat_curve,
             args.tuning_file,
             location,
-            args.shared_session,
+            args.device_id,
+            args.device_name,
         ),
         host=args.host,
         port=args.port,

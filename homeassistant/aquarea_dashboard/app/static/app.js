@@ -4,12 +4,12 @@ const $ = (id) => document.getElementById(id);
 let lastReport = null;
 let allowControl = false;
 let pollMinutes = 10;
-let offPollMinutes = 10;
 let historyGapMinutes = 30;
 let autoTimer = null;
+let liveTimer = null;
 let historyHours = 24;
-let currentUser = null;
-let tokenExpiration = null;
+const LIVE_MS = 10_000;
+const COMMAND_RELOAD_MS = 8_000; // HeishaMon reports a new value within seconds
 
 // ------------------------------------------------------------------ helpers
 function el(tag, attrs = {}, ...children) {
@@ -92,61 +92,100 @@ const num = (v) => (typeof v === "number" ? v : null);
 const round = (v, d = 2) => (v == null ? "–" : String(Math.round(v * 10 ** d) / 10 ** d));
 
 // ------------------------------------------------------------------ overview
+// Tiles with live values (updated from api/live between reports)
+let liveNodes = {};
+function liveTile(key, label) {
+  const node = tile(label, "–", " ");
+  liveNodes[key] = { node, value: node.querySelector(".value"), sub: node.querySelector(".sub") };
+  return node;
+}
+
+const ageText = (s) => (s < 90 ? `${s} s` : `${Math.round(s / 60)} min`);
+const watts = (v) => (typeof v === "number" ? `${Math.round(v)} W` : "–");
+const temp = (v) => (typeof v === "number" ? `${v} °C` : "–");
+const clock = (iso) => (iso ? new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "–");
+
+// The live values in the shape of api/live, from a report
+function liveFromReport(dev) {
+  const hm = dev.heishamon ?? {};
+  return { ...hm, energy: { live: dev.energy?.live, today: dev.energy?.today }, thermo: dev.thermo };
+}
+
+function applyLive(l) {
+  const set = (key, value, sub, cls) => {
+    const n = liveNodes[key];
+    if (!n) return;
+    n.value.textContent = value;
+    n.sub.textContent = sub;
+    if (cls) for (const [c, on] of Object.entries(cls)) n.node.classList.toggle(c, on);
+  };
+  set("heishamon", l.online ? "Online" : "Offline",
+    l.online ? `last value ${ageText(l.age_s ?? 0)} ago` : l.problem ?? "–", { warn: !l.online });
+  const freq = l.compressor_freq;
+  set("compressor", typeof freq !== "number" ? "–" : freq > 0 ? `Running ${freq} Hz` : "Off", "measured by HeishaMon",
+    { "comp-on": freq > 0, "comp-off": freq === 0 });
+  set("water", temp(l.outlet),
+    `Inlet ${temp(l.inlet)} · target ${temp(l.target)} · flow ${typeof l.flow === "number" ? `${l.flow} l/min` : "–"}`);
+  const live = l.energy?.live ?? {};
+  set("power", `${watts(l.power_in_w)} → ${watts(l.power_out_w)}`,
+    `electric in → heat out · COP ${live.cop ?? "–"}${live.cop != null ? ` (${live.window_min} min)` : ""}`);
+  const today = l.energy?.today ?? {};
+  set("today", today.kwh_in == null ? "–" : `${round(today.kwh_in)} kWh`,
+    `heat out ${today.kwh_out == null ? "–" : `${round(today.kwh_out)} kWh`} · COP ${today.cop ?? "–"}`);
+}
+
 function overviewTiles(dev) {
   const status = dev.status && !dev.status.error ? dev.status : null;
-  const raw = dev.raw_device_list_entry && !dev.raw_device_list_entry.error ? dev.raw_device_list_entry : null;
   const tiles = el("div", { class: "tiles" });
+  liveNodes = {};
 
-  const zone0Status = status?.zones?.[0]?.operation_status?.name;
-  const zone0Raw = raw?.zoneStatus?.[0]?.operationStatus;
-  const operation = zone0Status ?? (typeof zone0Raw === "number" ? (zone0Raw ? "ON" : "OFF") : "–");
-  const mode = status?.operation_mode?.name ?? dev.info?.mode?.name ?? "–";
-  const direction = status?.direction?.name ?? "–";
-  tiles.append(tile("Operation", operation, `Mode: ${mode} · Direction: ${direction}`));
+  tiles.append(liveTile("heishamon", "HeishaMon"));
+  const operation = status?.operation_status?.name ?? "–";
+  const mode = status?.operation_mode?.name ?? "–";
+  const direction = { WATER: "hot water", PUMP: "heating" }[status?.direction?.name] ?? "–";
+  tiles.append(tile("Operation", operation, `Mode: ${mode} · 3-way valve: ${direction}`));
   if (allowControl && status) tiles.lastChild.append(powerControl(dev.info.device_id, operation === "ON"));
   if (allowControl && dev.tuning) tiles.lastChild.append(earlyOffView(dev));
 
-  let outdoor = num(status?.temperature_outdoor);
-  let outdoorSrc = "live status";
-  if (outdoor == null && raw) { outdoor = num(raw.outdoorNow); outdoorSrc = "device list"; }
-  if (outdoor == null) {
-    const items = dev.consumption?.day?.items ?? [];
-    const last = [...items].reverse().find((i) => num(i.outdoor_temp) != null);
-    if (last) { outdoor = last.outdoor_temp; outdoorSrc = `energy data ${last.data_time}`; }
+  const comp = dev.compressor_today;
+  const compTile = liveTile("compressor", "Compressor");
+  if (comp) {
+    const perStart = comp.hours_per_start == null ? "–"
+      : `${comp.hours_per_start} h (${Math.round(comp.hours_per_start * 60)} min) per start`;
+    const run = compressorRunText(comp);
+    if (run) compTile.append(el("div", { class: "sub", text: run }));
+    compTile.append(el("div", { class: "sub", text: `Today: ${comp.starts} start${comp.starts === 1 ? "" : "s"} · running ${comp.hours} h · ${perStart}` }));
   }
-  tiles.append(tile("Outdoor", outdoor == null ? "–" : `${outdoor} °C`, outdoor == null ? null : outdoorSrc));
+  tiles.append(compTile);
 
-  const quiet = status?.quiet_mode?.value ?? raw?.quietMode;
-  if (typeof quiet === "number") {
-    tiles.append(tile("Quiet mode", quietLabel(quiet), "Level 3 = quietest"));
-    if (allowControl) tiles.lastChild.append(quietModeControl(dev.info.device_id, quiet));
-    if (dev.quiet_auto) tiles.lastChild.append(quietAutoView(dev));
+  const zone = status?.zones?.[0];
+  const waterTile = liveTile("water", "Water outlet");
+  if (zone && allowControl) {
+    waterTile.append(heatTargetControl(dev.info.device_id,
+      { id: zone.zone_id, set: zone.heat_set, min: zone.heat_min, max: zone.heat_max }));
   }
-
-  const zones = status?.zones?.length
-    ? status.zones.map((z) => ({ id: z.zone_id, t: z.temperature, set: z.heat_set, min: z.heat_min, max: z.heat_max, on: z.operation_status?.name, src: "live status" }))
-    : (raw?.zoneStatus ?? []).map((z) => ({ id: z.zoneId, t: z.temperatureNow, set: z.heatSet, min: z.heatMin, max: z.heatMax, on: z.operationStatus, src: "device list" }));
-  for (const z of zones) {
-    const on = z.on === undefined ? "" : ` · ${typeof z.on === "number" ? (z.on ? "ON" : "OFF") : z.on}`;
-    const t = tile(`Zone ${z.id} water`, num(z.t) == null ? "–" : `${z.t} °C`, `Set/shift: ${fmt("heat_set", z.set)}${on} · ${z.src}`);
-    if (allowControl) t.append(heatTargetControl(dev.info.device_id, z));
-    tiles.append(t);
-  }
+  tiles.append(waterTile);
 
   const wt = dev.water_target;
   if (wt && num(wt.target) != null) {
     const sign = (v) => (v > 0 ? `+${v}` : String(v));
     tiles.append(tile("Zone 1 target water", `${wt.target} °C`, wt.curve == null
-      ? "Direct setpoint"
-      : `Curve ${wt.curve} °C (${wt.curve_exact}) · shift ${sign(wt.shift)} · at ${wt.outdoor} °C outdoor`));
+      ? "Direct setpoint (no curve shift control)"
+      : `Curve ${wt.curve} °C · shift ${sign(wt.shift)} · at ${wt.outdoor} °C outdoor`));
   }
 
-  const tank = status?.tank_status?.[0]
-    ? { t: status.tank_status[0].temperature, set: status.tank_status[0].heat_set, src: "live status" }
-    : raw?.tankStatus && Object.keys(raw.tankStatus).length
-      ? { t: raw.tankStatus.temperatureNow, set: raw.tankStatus.heatSet, src: "device list" }
-      : null;
-  if (tank) tiles.append(tile("Hot water tank", num(tank.t) == null ? "–" : `${tank.t} °C`, `Target: ${fmt("heat_set", tank.set)} · ${tank.src}`));
+  tiles.append(liveTile("power", "Power now"));
+  tiles.append(liveTile("today", "Energy today"));
+
+  const outdoor = num(status?.temperature_outdoor);
+  tiles.append(tile("Outdoor", outdoor == null ? "–" : `${outdoor} °C`, "unit sensor"));
+
+  const quiet = status?.quiet_mode?.value;
+  if (typeof quiet === "number") {
+    tiles.append(tile("Quiet mode", quietLabel(quiet), "Level 3 = quietest"));
+    if (allowControl) tiles.lastChild.append(quietModeControl(dev.info.device_id, quiet));
+    if (dev.quiet_auto) tiles.lastChild.append(quietAutoView(dev));
+  }
 
   const faults = status?.fault_status ?? [];
   tiles.append(tile("Errors", faults.length ? faults.map((f) => f.error_code).join(", ") : status ? "None" : "–",
@@ -158,51 +197,33 @@ function overviewTiles(dev) {
     tiles.append(tile("Water pressure", num(extra.water_pressure) == null ? "–" : `${extra.water_pressure} bar`));
     tiles.append(tile("Defrost", onOff(extra.defrost),
       typeof dev.defrost_cycles_today === "number" ? `Cycles today: ${dev.defrost_cycles_today}` : null));
-    tiles.append(tile("Backup heat", onOff(extra.bivalent_active),
+    tiles.append(tile("Backup heater", onOff(extra.internal_heater),
       `Force heater: ${onOff(extra.force_heater)} · External heater: ${onOff(extra.external_heater)}`));
   }
-
-  const comp = dev.compressor_today;
-  if (comp) {
-    const perStart = comp.hours_per_start == null ? "–"
-      : `${comp.hours_per_start} h (${Math.round(comp.hours_per_start * 60)} min) per start`;
-    const today = `Today: ${comp.starts} start${comp.starts === 1 ? "" : "s"} · running ${comp.hours} h · ${perStart}`;
-    const running = comp.state === "ON";
-    if (comp.state === "ON" || comp.state === "OFF") {
-      const t = tile("Compressor (est.)", running ? "Running" : "Off", compressorRunText(comp));
-      t.classList.add(running ? "comp-on" : "comp-off");
-      t.append(el("div", { class: "sub", text: today }));
-      tiles.append(t);
-    } else {
-      tiles.append(tile("Compressor today (est.)", `${comp.starts} start${comp.starts === 1 ? "" : "s"}`,
-        `Running ${comp.hours} h · ${perStart}`));
-    }
-  }
-
-  const dayItems = dev.consumption?.day?.items ?? [];
-  if (dayItems.length) {
-    const total = dayItems.reduce((s, i) => s + (num(i.total_consumption) ?? 0), 0);
-    const cost = dayItems.reduce((s, i) => s + (num(i.heat_cost) ?? 0) + (num(i.cool_cost) ?? 0) + (num(i.tank_cost) ?? 0), 0);
-    tiles.append(tile("Energy today", `${round(total)} kWh`, `Cost: ${round(cost)}`));
-  }
+  applyLive(liveFromReport(dev));
   return tiles;
 }
 
 // ------------------------------------------------------------------ control
+// HeishaMon reports the new value within seconds: reload the report shortly after a command.
+function afterCommand(text = "Command sent; the unit reports the new value within a few seconds.") {
+  $("status-line").textContent = text;
+  setTimeout(loadReport, COMMAND_RELOAD_MS);
+}
+
 function powerControl(deviceId, isOn) {
-  const btn = el("button", { type: "button", text: isOn ? "Turn heating off" : "Turn heating on" });
+  const btn = el("button", { type: "button", text: isOn ? "Turn heat pump off" : "Turn heat pump on" });
   btn.addEventListener("click", async () => {
-    if (!confirm(`Turn the heating ${isOn ? "OFF" : "ON"}?`)) return;
+    if (!confirm(`Turn the heat pump ${isOn ? "OFF" : "ON"}?`)) return;
     btn.disabled = true;
     btn.textContent = "Sending…";
     try {
       await postJSON("api/device/power", { device_id: deviceId, on: !isOn });
-      await loadReport();
+      afterCommand();
     } catch (e) {
-      if (e.status === 401) return showLogin(e.message);
       showAppError(e.message);
       btn.disabled = false;
-      btn.textContent = isOn ? "Turn heating off" : "Turn heating on";
+      btn.textContent = isOn ? "Turn heat pump off" : "Turn heat pump on";
     }
   });
   return el("div", { class: "control" }, el("div", { class: "control-row" }, btn));
@@ -249,7 +270,6 @@ function buildEarlyOffView(deviceId) {
       details.open = false;
       await loadReport();
     } catch (e) {
-      if (e.status === 401) return showLogin(e.message);
       showAppError(e.message);
     } finally {
       btn.disabled = false;
@@ -315,9 +335,8 @@ function quietModeControl(deviceId, current) {
     btn.textContent = "Sending…";
     try {
       await postJSON("api/device/quiet-mode", { device_id: deviceId, level });
-      await loadReport();
+      afterCommand();
     } catch (e) {
-      if (e.status === 401) return showLogin(e.message);
       showAppError(e.message);
     } finally {
       btn.disabled = false;
@@ -409,7 +428,6 @@ function buildQuietAutoView(deviceId) {
       setValues(res.quiet_auto.settings);
       render(res.quiet_auto);
     } catch (e) {
-      if (e.status === 401) return showLogin(e.message);
       showAppError(e.message);
     } finally {
       save.disabled = false;
@@ -453,9 +471,8 @@ function heatTargetControl(deviceId, zone) {
     btn.textContent = "Sending…";
     try {
       await postJSON("api/zone/heat-target", { device_id: deviceId, zone_id: zone.id, value });
-      await loadReport();
+      afterCommand();
     } catch (e) {
-      if (e.status === 401) return showLogin(e.message);
       showAppError(e.message);
     } finally {
       btn.disabled = false;
@@ -478,7 +495,7 @@ function shortLabel(t) {
   return s.includes(" ") ? s.split(" ").pop() : s.slice(-2);
 }
 
-function energyView(consumption) {
+function energyView(energy) {
   const wrap = el("div");
   const tabs = el("div", { class: "tabs" });
   const body = el("div");
@@ -486,7 +503,7 @@ function energyView(consumption) {
 
   function show(key) {
     for (const b of tabs.children) b.classList.toggle("active", b.dataset.key === key);
-    body.replaceChildren(energyBlock(consumption[key]));
+    body.replaceChildren(energyBlock(energy[key]));
   }
   for (const [key, label] of views) {
     const b = el("button", { type: "button", text: label });
@@ -499,48 +516,46 @@ function energyView(consumption) {
   return wrap;
 }
 
+// Bars: electricity in (bottom) + ambient heat (out − in) on top, so the full bar is the heat produced.
 function energyBlock(block) {
-  if (!block) return el("p", { class: "muted", text: "No data requested." });
-  if (block.error) return el("p", { class: "error", text: block.error });
+  if (!block) return el("p", { class: "muted", text: "No data." });
   const items = block.items ?? [];
-  if (!items.length) return el("p", { class: "muted", text: `No data for ${block.date}.` });
+  if (!items.length) return el("p", { class: "muted", text: `No data for ${block.date ?? "this period"} yet.` });
 
-  const max = Math.max(...items.map((i) => (num(i.heat_consumption) ?? 0) + (num(i.cool_consumption) ?? 0) + (num(i.tank_consumption) ?? 0)), 0.0001);
+  const max = Math.max(...items.map((i) => Math.max(num(i.kwh_in) ?? 0, num(i.kwh_out) ?? 0)), 0.0001);
   const chart = el("div", { class: "chart" });
   const labels = el("div", { class: "chart-labels" });
   for (const i of items) {
-    const bar = el("div", { class: "bar", title: `${i.data_time}: ${round(i.total_consumption, 3)} kWh` });
-    for (const [cls, v] of [["heat", i.heat_consumption], ["cool", i.cool_consumption], ["tank", i.tank_consumption]]) {
+    const kin = num(i.kwh_in) ?? 0, kout = num(i.kwh_out);
+    const bar = el("div", { class: "bar", title: `${i.label}: in ${round(i.kwh_in, 3)} kWh · out ${round(i.kwh_out, 3)} kWh · COP ${i.cop ?? "–"}` });
+    for (const [cls, v] of [["heat", kin], ["cool", kout == null ? 0 : Math.max(0, kout - kin)]]) {
       const seg = el("span", { class: cls });
-      seg.style.height = `${((num(v) ?? 0) / max) * 100}%`;
+      seg.style.height = `${(v / max) * 100}%`;
       bar.append(seg);
     }
     chart.append(bar);
-    labels.append(el("span", { text: shortLabel(i.data_time) }));
+    labels.append(el("span", { text: shortLabel(i.label) }));
   }
   const legend = el("div", { class: "legend" },
-    el("span", {}, el("i", { class: "heat" }), "Heating"),
-    el("span", {}, el("i", { class: "cool" }), "Cooling"),
-    el("span", {}, el("i", { class: "tank" }), "Hot water"));
+    el("span", {}, el("i", { class: "heat" }), "Electricity in"),
+    el("span", {}, el("i", { class: "cool" }), "Ambient heat (out − in)"));
 
-  const sum = (k) => items.reduce((s, i) => s + (num(i[k]) ?? 0), 0);
-  const head = el("tr", {}, ...["Time", "Heat kWh", "Cool kWh", "Tank kWh", "Total kWh", "Cost", "Outdoor °C"]
-    .map((h, idx) => el("th", { class: idx ? "num" : "", text: h })));
+  const head = el("tr", {}, ...["Time", "In kWh", "Out kWh", "COP", "Source"]
+    .map((h, idx) => el("th", { class: idx && idx < 4 ? "num" : "", text: h })));
   const rows = items.map((i) => el("tr", {},
-    el("td", { text: i.data_time ?? "–" }),
-    el("td", { class: "num", text: round(i.heat_consumption, 3) }),
-    el("td", { class: "num", text: round(i.cool_consumption, 3) }),
-    el("td", { class: "num", text: round(i.tank_consumption, 3) }),
-    el("td", { class: "num", text: round(i.total_consumption, 3) }),
-    el("td", { class: "num", text: round((num(i.heat_cost) ?? 0) + (num(i.cool_cost) ?? 0) + (num(i.tank_cost) ?? 0)) }),
-    el("td", { class: "num", text: i.outdoor_temp ?? "–" })));
+    el("td", { text: i.label ?? "–" }),
+    el("td", { class: "num", text: round(i.kwh_in, 3) }),
+    el("td", { class: "num", text: round(i.kwh_out, 3) }),
+    el("td", { class: "num", text: i.cop ?? "–" }),
+    el("td", { text: i.source ?? "" })));
+  const sum = (list, k) => list.reduce((s, i) => s + (num(i[k]) ?? 0), 0);
+  const both = items.filter((i) => num(i.kwh_in) != null && num(i.kwh_out) != null);
+  const copIn = sum(both, "kwh_in");
   const totals = el("tr", {},
     el("th", { text: "Sum" }),
-    el("th", { class: "num", text: round(sum("heat_consumption"), 3) }),
-    el("th", { class: "num", text: round(sum("cool_consumption"), 3) }),
-    el("th", { class: "num", text: round(sum("tank_consumption"), 3) }),
-    el("th", { class: "num", text: round(sum("total_consumption"), 3) }),
-    el("th", { class: "num", text: round(sum("heat_cost") + sum("cool_cost") + sum("tank_cost")) }),
+    el("th", { class: "num", text: round(sum(items, "kwh_in"), 3) }),
+    el("th", { class: "num", text: items.some((i) => num(i.kwh_out) != null) ? round(sum(items, "kwh_out"), 3) : "–" }),
+    el("th", { class: "num", text: copIn > 0 ? round(sum(both, "kwh_out") / copIn) : "–" }),
     el("th"));
 
   return el("div", {}, legend, chart, labels,
@@ -587,6 +602,7 @@ function historyView(deviceId) {
 }
 
 const POWER_COLOR = "#b7950b";
+const HEAT_OUT_COLOR = "#27ae60";
 const HA_COLORS = ["#27ae60", "#c0392b", "#16a085", "#d35400", "#2c3e50", "#e84393", "#7f8c8d", "#6c5ce7"];
 // The server (compressor.py) estimates the compressor state per row: fields
 // compressor, compressor_why, near_thermo_off. These constants mirror it for the legend text.
@@ -614,13 +630,19 @@ function historyChart(rows) {
   const haKeys = [...new Set(pts.flatMap((p) => Object.keys(p).filter((k) => k.startsWith("ha:") && typeof p[k] === "number")))].sort();
   const W = narrow ? 340 : 900, L = narrow ? 60 : 48, R = haKeys.length ? (narrow ? 40 : 48) : 16, T = 12, plotH = narrow ? 160 : 220, bandH = 14, bandGap = 6;
   const xTicks = narrow ? 3 : 6;
-  // Average power between consecutive changes of today's kWh total (the cloud
-  // updates it in steps); the first step after a start/reset has no known start.
-  const power = [];
+  // Power: measured by HeishaMon (power_in_w, held until the next row); older cloud rows
+  // only have today's kWh total, so their average power comes from its steps.
+  const power = [], powerOut = [];
+  pts.forEach((p, i) => {
+    const next = pts[i + 1];
+    if (typeof p.power_in_w !== "number" || !next || next.t - p.t > historyGapMinutes * 60_000) return;
+    power.push({ from: p.t, to: next.t, kw: p.power_in_w / 1000 });
+    if (typeof p.power_out_w === "number") powerOut.push({ from: p.t, to: next.t, kw: p.power_out_w / 1000 });
+  });
   let prevE = null, lastChange = null;
   for (const p of pts) {
     const e = p.energy_today_kwh;
-    if (typeof e !== "number") continue;
+    if (typeof e !== "number" || typeof p.power_in_w === "number") continue;
     if (prevE !== null && e < prevE.energy_today_kwh) {
       lastChange = null; // new day
     } else if (prevE !== null && e !== prevE.energy_today_kwh) {
@@ -629,15 +651,17 @@ function historyChart(rows) {
     }
     prevE = p;
   }
-  const hasEnergy = prevE !== null;
-  const powerAt = (t) => power.find((s) => t > s.from && t <= s.to);
+  const hasEnergy = prevE !== null || power.length > 0;
+  const powerAt = (t) => power.find((s) => t >= s.from && t < s.to);
+  const outAt = (t) => powerOut.find((s) => t >= s.from && t < s.to);
   const powerH = hasEnergy ? (narrow ? 60 : 80) : 0;
   const powerTop = T + plotH + 30;
   const bandsTop = hasEnergy ? powerTop + powerH + 14 : T + plotH + 26;
   const series = [
-    { key: "zone1_water_temperature", label: "Zone 1 water", color: "#e4572e" },
+    { key: "zone1_water_temperature", label: "Water outlet", color: "#e4572e" },
     { key: "outdoor_temperature", label: "Outdoor", color: "#2e86de" },
     { key: "zone1_target_temperature", label: "Zone 1 target", color: "#e4572e", dash: "6 4" },
+    { key: "inlet_temperature", label: "Water inlet", color: "#f1948a", dash: "2 3" },
   ];
   // named from the latest report
   const haNames = Object.fromEntries((lastReport?.ha_sensors?.sensors ?? []).map((s) => [s.entity_id, s.name]));
@@ -647,8 +671,8 @@ function historyChart(rows) {
     series.push({ key, label, legend: `${label} (right axis)`, color: HA_COLORS[i % HA_COLORS.length], right: true });
   });
   const bands = [
-    { key: "compressor", label: "Comp.*", legend: "Compressor (estimated)", color: "#c0392b", colors: { ON: "#c0392b" } },
-    { key: "near_thermo_off", label: "Th.off*", legend: `Near thermo off (water ≥ target + ${THERMO_OFF_K - 1} K / + ${THERMO_OFF_K} K)`, color: "#e67e22", colors: { NEAR: "#f5b041", ABOVE: "#d35400" } },
+    { key: "compressor", label: "Comp.", legend: "Compressor (measured; cloud-era rows estimated)", color: "#c0392b", colors: { ON: "#c0392b" } },
+    { key: "near_thermo_off", label: "Th.off", legend: `Near thermo off (water > target + ${THERMO_OFF_K - 1} K / + ${THERMO_OFF_K} K)`, color: "#e67e22", colors: { NEAR: "#f5b041", ABOVE: "#d35400" } },
     { key: "zone1_heat_shift", label: "Shift", legend: "Curve shift (red > 0, blue < 0)", color: SHIFT_UP_COLOR,
       colorOf: (v) => (typeof v !== "number" || v === 0 ? null : v > 0 ? SHIFT_UP_COLOR : SHIFT_DOWN_COLOR) },
     { key: "operation_status", label: "Operation", color: "#17a589", colors: { ON: "#17a589" } },
@@ -725,7 +749,7 @@ function historyChart(rows) {
 
   // average power (kW) panel
   if (hasEnergy) {
-    const pMax = Math.max(1, Math.ceil(Math.max(0, ...power.map((s) => s.kw))));
+    const pMax = Math.max(1, Math.ceil(Math.max(0, ...power.map((s) => s.kw), ...powerOut.map((s) => s.kw))));
     const py = (v) => powerTop + (1 - v / pMax) * powerH;
     root.append(svg("rect", { x: L, y: powerTop, width: W - L - R, height: powerH, fill: "#f6f8fa" }));
     for (const v of [0, pMax / 2, pMax]) {
@@ -737,8 +761,11 @@ function historyChart(rows) {
       const top = py(Math.max(0, s.kw));
       root.append(svg("rect", { x: x1, y: top, width: Math.max(1, x(s.to) - x1), height: powerTop + powerH - top, fill: POWER_COLOR, opacity: 0.8 }));
     }
+    let dOut = "";
+    for (const s of powerOut) dOut += `M${x(s.from).toFixed(1)},${py(s.kw).toFixed(1)} H${x(s.to).toFixed(1)} `;
+    if (dOut) root.append(svg("path", { d: dOut, fill: "none", stroke: HEAT_OUT_COLOR, "stroke-width": 2 }));
     if (!power.length) {
-      root.append(svg("text", { x: L + 8, y: powerTop + powerH / 2 + 4, class: "axis", text: "Waiting for two consumption updates…" }));
+      root.append(svg("text", { x: L + 8, y: powerTop + powerH / 2 + 4, class: "axis", text: "Waiting for power values…" }));
     }
   }
 
@@ -771,15 +798,18 @@ function historyChart(rows) {
     cursor.setAttribute("x1", x(best.t));
     cursor.setAttribute("x2", x(best.t));
     cursor.setAttribute("visibility", "visible");
+    const kw = (s) => (s ? `${s.kw.toFixed(2)} kW` : "–");
     readout.textContent =
-      `${new Date(best.t).toLocaleString()} · Zone 1 water ${fmt("temp", best.zone1_water_temperature)} · ` +
+      `${new Date(best.t).toLocaleString()} · Water out ${fmt("temp", best.zone1_water_temperature)} · ` +
+      `in ${fmt("temp", best.inlet_temperature)} · ` +
       `Outdoor ${fmt("temp", best.outdoor_temperature)} · Operation ${best.operation_status || "–"} · ` +
       `Pump ${best.pump_duty || "–"} · Direction ${best.direction || "–"} · Defrost ${best.defrost || "–"} · ` +
+      `Compressor ${typeof best.compressor_freq === "number" ? `${best.compressor_freq} Hz` : best.compressor ? `${best.compressor} (${best.compressor_why})` : "–"} · ` +
+      `Power in ${kw(powerAt(best.t))} · out ${kw(outAt(best.t))} · ` +
+      `Flow ${typeof best.pump_flow === "number" ? `${best.pump_flow} l/min` : "–"} · ` +
       `Energy today ${typeof best.energy_today_kwh === "number" ? `${best.energy_today_kwh} kWh` : "–"} · ` +
-      `Avg power ${powerAt(best.t) ? `${powerAt(best.t).kw.toFixed(2)} kW` : "–"} · ` +
-      `Compressor (est.) ${best.compressor ? `${best.compressor} (${best.compressor_why})` : "–"} · ` +
       `Shift ${typeof best.zone1_heat_shift === "number" ? best.zone1_heat_shift : "–"} · source ${best.source || "–"}` +
-      series.slice(2).map((s) => ` · ${s.label} ${fmt("temp", best[s.key])}`).join("");
+      series.slice(4).map((s) => ` · ${s.label} ${fmt("temp", best[s.key])}`).join("");
   };
   overlay.addEventListener("pointermove", showPoint);
   overlay.addEventListener("pointerdown", showPoint);
@@ -788,7 +818,8 @@ function historyChart(rows) {
   });
 
   const legend = el("div", { class: "legend" },
-    ...[...series, ...(hasEnergy ? [{ label: "Avg power (kW)", color: POWER_COLOR }] : []), ...bands].map((s) => {
+    ...[...series, ...(hasEnergy ? [{ label: "Power in (kW)", color: POWER_COLOR }] : []),
+      ...(powerOut.length ? [{ label: "Heat out (kW)", color: HEAT_OUT_COLOR }] : []), ...bands].map((s) => {
       const swatch = el("i");
       swatch.style.background = s.dash
         ? `repeating-linear-gradient(90deg, ${s.color} 0 4px, transparent 4px 7px)`
@@ -803,11 +834,11 @@ function historyChart(rows) {
     knownMs += next.t - p.t;
     if (p.compressor === "ON") onMs += next.t - p.t;
   });
-  const runtime = knownMs ? ` · compressor (est.) running ${(onMs / 3_600_000).toFixed(1)} h of ${(knownMs / 3_600_000).toFixed(1)} h` : "";
+  const runtime = knownMs ? ` · compressor running ${(onMs / 3_600_000).toFixed(1)} h of ${(knownMs / 3_600_000).toFixed(1)} h` : "";
 
   return el("div", {}, legend, root, readout,
     el("p", { class: "muted", text: `${pts.length} data point(s) · stored in the history CSV${runtime}` }),
-    explain("compressor", `* Compressor estimated: OFF when operation is off, ON in defrost. Panasonic thermostat: OFF when Zone 1 water ≥ target + ${THERMO_OFF_K} K for ${THERMO_MS / 60_000} min (highest target of the last ${TARGET_UPDATE_MS / 60_000} min, since the unit's update time is unknown). Zone 1 water rising ${WATER_STEP_K} K above its low since the last change (e.g. the uptick after the pump-start dip) = ON, falling ${WATER_STEP_K} K below its high = OFF. Otherwise 15-min avg power ≥ ${COMPRESSOR_ON_KW * 1000} W = ON, ≤ ${COMPRESSOR_OFF_KW * 1000} W = OFF (ignored for ${POWER_LAG_MIN} min after a water-detected change, as the kWh total lags). Th.off: light = water within 1 K of target + ${THERMO_OFF_K} K (lowest possible target), dark = at/above it for the highest possible target (3-min timer running).`, "* Compressor estimate"));
+    explain("compressor", `Rows from HeishaMon: compressor ON when its frequency is above 0 Hz; power in/out as measured by the unit (held until the next row). Th.off: light = water outlet more than ${THERMO_OFF_K - 1} K above target, dark = more than ${THERMO_OFF_K} K (the unit's thermo off timer, about ${THERMO_MS / 60_000} min, runs). Older rows from the Panasonic cloud: compressor estimated (OFF when operation is off, ON in defrost; water rising/falling ${WATER_STEP_K} K; otherwise 15-min avg power ≥ ${COMPRESSOR_ON_KW * 1000} W = ON, ≤ ${COMPRESSOR_OFF_KW * 1000} W = OFF, ignored for ${POWER_LAG_MIN} min after a water-detected change; highest target of the last ${TARGET_UPDATE_MS / 60_000} min) and power from steps of today's kWh total.`, "Compressor and power"));
 }
 
 // ------------------------------------------------------------------ tuning
@@ -845,7 +876,7 @@ function buildTuningView(deviceId) {
     up_max: numberInput("0", "5"),
     down_max: numberInput("0", "5"),
     min_run_min: numberInput("0", "240", "10"),
-    up_wait_pct: numberInput("0", "100", "5"),
+    step_lead_s: numberInput("20", "150", "5"),
     max_pause_min: numberInput("0", "300", "10"),
     indoor_target: numberInput("15", "28", "0.1"),
     min_outdoor: numberInput("-25", "20", "0.5"),
@@ -880,8 +911,8 @@ function buildTuningView(deviceId) {
     field("Max. shift up", f.up_max, "steps above normal while heat is needed"),
     field("Shift down", f.down_max, "below normal after a stop (night / warm)"),
     field("Min. compressor run, min.", f.min_run_min, "shift up (within max.) until a run lasts this long; 0 = off"),
-    field("Up step wait, % of last degree", f.up_wait_pct,
-      "a +1 step waits this share of the time the water took for its last degree; 0 = at once; at target + 3 K always at once"),
+    field("Step lead before thermo off, s", f.step_lead_s,
+      "the +1 step is sent this long before the unit's thermo off timer (water > target + 3 K for 3 min) runs out"),
     field("Max. compressor pause, min.", f.max_pause_min, "then, if the room is at or below target, a shift below normal goes back to normal; 0 = off"),
     field("Indoor target °C", f.indoor_target, "warmer = down mode"),
     field("Min. outdoor °C", f.min_outdoor, "colder = no tuning, normal shift"),
@@ -914,15 +945,15 @@ function buildTuningView(deviceId) {
   const log = el("div");
   const details = section("Hysteresis tuning (curve shift)", el("div", {},
     explain("tuning",
-      "Lengthens compressor runs: while it runs and the room needs heat, the shift goes up by 1 when the water is " +
-      "within 1 K of the thermo off point (target + 3 K), up to normal + max. When the compressor stops, the shift " +
+      "Lengthens compressor runs: while it runs and the room needs heat, the shift goes up by 1 shortly before the " +
+      "unit would stop: HeishaMon shows when the water outlet goes above target + 3 K, which starts the unit's " +
+      "3-minute thermo off timer; the step is sent the set lead time before it runs out (once per timer; resent once " +
+      "if the unit does not confirm it), up to normal + max. When the compressor stops, the shift " +
       "goes back to normal, or down by \u201cshift down\u201d in the night hours while a shutoff is planned or running " +
       "(otherwise the room decides, e.g. after the 6am gate) or when the room is warmer than the indoor target " +
       "(also later while it is off, as soon as that applies); " +
       "when it starts again (or runs with the shift below normal), back to normal. Until a run reaches the minimum run time the shift also goes up in " +
       "down mode (never above normal + max); after that it goes back to normal and the compressor stops on its own. " +
-      "A +1 step waits the set share of the time the water took to heat up its last degree, counted from reaching " +
-      "the current degree (avoids spikes in the unit's power calculation). " +
       "If the compressor stays off longer than the maximum pause with the shift lowered and the room is not " +
       "warmer than the indoor target, the shift goes back to normal so it restarts on its own (no shift down again " +
       "until it has run). " +
@@ -986,7 +1017,7 @@ function buildTuningView(deviceId) {
     f.night_off_dynamic.checked = s.night_off_dynamic;
     f.night_off_gate.checked = s.night_off_gate;
     f.early_off_auto.checked = s.early_off_auto;
-    for (const k of ["normal_shift", "up_max", "down_max", "min_run_min", "up_wait_pct", "max_pause_min", "indoor_target", "min_outdoor", "night_start", "night_end",
+    for (const k of ["normal_shift", "up_max", "down_max", "min_run_min", "step_lead_s", "max_pause_min", "indoor_target", "min_outdoor", "night_start", "night_end",
       "night_off_min_mean", "night_off_min_low", "night_off_early_min", "night_off_early_wait_min", "night_off_trend_min", "night_off_gate_temp", "early_off_auto_temp",
       "night_off_gate_time", "night_off_dynamic_from", "night_off_dynamic_until", "night_off_dynamic_margin"]) f[k].value = String(s[k]);
     fillSensors(s.indoor_sensor);
@@ -1007,6 +1038,38 @@ function buildTuningView(deviceId) {
     return parts.join(" · ");
   }
 
+  function thermoText(th) {
+    if (!th) return "–";
+    const parts = [];
+    if (th.timer) {
+      parts.push(`timer running since ${clock(th.timer.since)}, off at ${clock(th.timer.off_at)}` +
+        (th.timer.step_at ? `, step at ${clock(th.timer.step_at)}` : ""));
+    } else {
+      parts.push(`water ${temp(th.outlet)}, timer starts above ${temp(th.threshold)}`);
+    }
+    const stop = th.stops?.[th.stops.length - 1];
+    if (stop) {
+      parts.push(`last stop ${new Date(stop.time).toLocaleString()} ` +
+        (stop.over_s == null ? "without timer" : `after ${stop.over_s} s above`) + (stop.rule ? "" : " (not explained by the rule)"));
+    }
+    return parts.join(" · ");
+  }
+
+  function restartText(th) {
+    const rule = th?.restart_rule;
+    if (!rule) return "–";
+    const b = rule.best;
+    const sign = (v) => (v >= 0 ? `+${v}` : `−${Math.abs(v)}`);
+    const parts = [b
+      ? `${rule.ready ? "" : "learning: "}water ≤ ${b.relative_to} ${sign(b.offset)} K (±${b.spread}, ${b.n} restarts)`
+      : `learning (${rule.restarts} restart${rule.restarts === 1 ? "" : "s"} so far)`];
+    if (th.paused_since) parts.push(`paused since ${clock(th.paused_since)}`);
+    if (th.restart) {
+      parts.push(`expected below ${temp(th.restart.threshold)}` + (th.restart.eta ? ` at about ${clock(th.restart.eta)}` : ""));
+    }
+    return parts.join(" · ");
+  }
+
   function render(t, dev) {
     const sign = (v) => (typeof v === "number" ? (v > 0 ? `+${v}` : String(v)) : "–");
     const st = t.state ?? {}, live = t.live ?? {};
@@ -1023,10 +1086,9 @@ function buildTuningView(deviceId) {
       ["Indoor", typeof live.indoor === "number" ? `${live.indoor} °C (target ${t.settings.indoor_target} °C)` : "–"],
       ["Outdoor", typeof live.outdoor === "number" ? `${live.outdoor} °C (min. ${t.settings.min_outdoor} °C)` : "–"],
       ["Room cooling (learned)", coolingText(t.cooling)],
-      ["Compressor (est.)", st.compressor ?? "–"],
-      ["Water heating", typeof st.water_degree_min === "number"
-        ? `last degree ${st.water_degree_min} min · up step wait ${Math.round(st.water_degree_min * t.settings.up_wait_pct / 10) / 10} min`
-        : "no degree timed yet"],
+      ["Compressor", st.compressor ?? "–"],
+      ["Thermo off", thermoText(dev?.thermo)],
+      ["Restart", restartText(dev?.thermo)],
       ["Forecast", forecastText(t.night_off?.forecast)],
       ["Night-time shutoff", `${t.night_off?.active ? "Unit off – " : ""}${t.night_off?.note ?? "–"}`],
       ["Early off", t.early_off ? `until ${untilText(t.early_off.until)}` : "–"],
@@ -1054,7 +1116,7 @@ function buildTuningView(deviceId) {
       up_max: Number(f.up_max.value),
       down_max: Number(f.down_max.value),
       min_run_min: Number(f.min_run_min.value),
-      up_wait_pct: Number(f.up_wait_pct.value),
+      step_lead_s: Number(f.step_lead_s.value),
       max_pause_min: Number(f.max_pause_min.value),
       indoor_target: Number(f.indoor_target.value),
       min_outdoor: Number(f.min_outdoor.value),
@@ -1090,7 +1152,6 @@ function buildTuningView(deviceId) {
       setValues(res.tuning.settings);
       render(res.tuning, lastDev);
     } catch (e) {
-      if (e.status === 401) return showLogin(e.message);
       showAppError(e.message);
     } finally {
       save.disabled = false;
@@ -1135,14 +1196,12 @@ function haSensorTiles(ha) {
 function renderReport(report) {
   const container = $("devices");
   container.replaceChildren();
-  const offNote = offPollMinutes > pollMinutes ? ` (${offPollMinutes} min while the unit is off)` : "";
   $("status-line").textContent =
-    `Updated ${new Date(report.generated_at).toLocaleString()} · auto-update every ${pollMinutes} min${offNote} · ` +
-    `${report.account.device_count} device(s) · ` +
-    `token valid until ${report.account.token_expiration ? new Date(report.account.token_expiration).toLocaleString() : "–"}`;
+    `Updated ${new Date(report.generated_at).toLocaleString()} · report every ${pollMinutes} min, live values every ${LIVE_MS / 1000} s` +
+    (mqttInfo ? ` · HeishaMon via MQTT ${mqttInfo.host}:${mqttInfo.port}, topic ${mqttInfo.base_topic}` : "");
 
   if (!report.devices.length) {
-    container.append(el("p", { class: "muted", text: "No devices found on this account." }));
+    container.append(el("p", { class: "muted", text: "No device." }));
     return;
   }
 
@@ -1154,26 +1213,22 @@ function renderReport(report) {
 
     if (dev.status?.error) {
       container.append(el("div", { class: "card" },
-        el("p", { class: "error", text: `Live status unavailable: ${dev.status.error}` }),
-        dev.status.cause ? el("p", { class: "muted", text: `Cause: ${dev.status.cause}` }) : null,
-        el("p", { class: "muted", text: "Values marked “device list” come from the device overview instead." })));
+        el("p", { class: "error", text: `No values from HeishaMon: ${dev.status.error}` })));
     }
     container.append(section("History", historyView(dev.info.device_id), true));
     const tuning = tuningSection(dev);
     if (tuning) container.append(tuning);
-    if (dev.consumption) container.append(section("Energy consumption", energyView(dev.consumption), true));
-    container.append(section("Live status (DeviceStatus)", kvTable(dev.status ?? {})));
-    container.append(section("Derived / computed", kvTable(dev.derived ?? {})));
-    container.append(section("Configuration (DeviceInfo)", kvTable(dev.info ?? {})));
-    container.append(section("Raw device list entry", kvTable(dev.raw_device_list_entry ?? {})));
+    if (dev.energy) container.append(section("Energy (measured by HeishaMon)", energyView(dev.energy), true));
+    container.append(section("Status", kvTable(dev.status ?? {})));
+    container.append(section("All HeishaMon values", kvTable(dev.heishamon?.values ?? {})));
+    container.append(section("Device", kvTable(dev.info ?? {})));
   }
 }
 
 // ------------------------------------------------------------------ api
 // A 401 without our JSON error comes from Home Assistant's ingress proxy (its
 // session cookie expired or is not renewed yet, e.g. right after the companion
-// app starts or resumes). The HA frontend renews it within a minute, so retry
-// instead of asking for the Aquarea login.
+// app is starting or resumes). The HA frontend renews it within a minute, so retry.
 const INGRESS_RETRY_MS = 3000;
 const INGRESS_RETRIES = 30;
 
@@ -1199,44 +1254,12 @@ async function api(path, options = {}) {
 const postJSON = (path, body) =>
   api(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
 
-function setAccount(text, { canLogin, canLogout }) {
-  $("user").textContent = text;
-  $("btn-show-login").hidden = !canLogin;
-  $("btn-logout").hidden = !canLogout;
-}
-
-// message: why login is needed; currentUser stays set if the server still has
-// a (stale) session, so "Log out" can delete its stored token.
-function showLogin(message) {
-  stopAutoUpdate();
-  $("app-view").hidden = true;
-  $("toolbar").hidden = true;
-  $("login-view").hidden = false;
-  $("login-error").hidden = !message;
-  $("login-error").textContent = message ?? "";
-  setAccount(currentUser ? `${currentUser} · session expired` : "Not signed in",
-    { canLogin: true, canLogout: !!currentUser });
-  if (currentUser && !$("username").value) $("username").value = currentUser;
-  ($("username").value ? $("password") : $("username")).focus();
-}
-
-function showApp(username) {
-  currentUser = username;
-  $("login-view").hidden = true;
-  $("app-view").hidden = false;
-  $("toolbar").hidden = false;
-  const until = tokenExpiration ? ` · token until ${new Date(tokenExpiration).toLocaleString()}` : "";
-  setAccount(`Signed in as ${username}${until}`, { canLogin: false, canLogout: true });
-  startAutoUpdate();
-}
-
+let mqttInfo = null;
 function applySession(s) {
   allowControl = !!s.allow_control;
   pollMinutes = s.poll_minutes ?? pollMinutes;
-  offPollMinutes = s.off_poll_minutes ?? pollMinutes;
   historyGapMinutes = s.history_gap_minutes ?? 3 * pollMinutes;
-  currentUser = s.logged_in ? s.username : null;
-  tokenExpiration = s.token_expiration ?? null;
+  mqttInfo = s.mqtt ?? null;
 }
 
 // The server refreshes every pollMinutes; check its cached result once a minute.
@@ -1247,19 +1270,25 @@ async function checkLatest() {
       lastReport = report;
       renderReport(report);
     }
-  } catch (e) {
-    if (e.status === 401) showLogin(e.message);
-  }
+  } catch { /* next try in a minute */ }
+}
+
+async function checkLive() {
+  try {
+    applyLive(await api("api/live"));
+  } catch { /* next try shortly */ }
 }
 
 function startAutoUpdate() {
   stopAutoUpdate();
   autoTimer = setInterval(checkLatest, 60_000);
+  liveTimer = setInterval(checkLive, LIVE_MS);
 }
 
 function stopAutoUpdate() {
   if (autoTimer) clearInterval(autoTimer);
-  autoTimer = null;
+  if (liveTimer) clearInterval(liveTimer);
+  autoTimer = liveTimer = null;
 }
 
 async function loadReport() {
@@ -1268,11 +1297,9 @@ async function loadReport() {
   btn.textContent = "Loading…";
   $("app-error").hidden = true;
   try {
-    const consumption = $("opt-consumption").checked ? "1" : "0";
-    lastReport = await api(`api/report?consumption=${consumption}`);
+    lastReport = await api("api/report");
     renderReport(lastReport);
   } catch (e) {
-    if (e.status === 401) return showLogin(e.message);
     showAppError(e.message);
   } finally {
     btn.disabled = false;
@@ -1281,39 +1308,7 @@ async function loadReport() {
 }
 
 // ------------------------------------------------------------------ events
-$("login-form").addEventListener("submit", async (ev) => {
-  ev.preventDefault();
-  const btn = $("btn-login");
-  btn.disabled = true;
-  btn.textContent = "Signing in…";
-  $("login-error").hidden = true;
-  try {
-    const res = await postJSON("api/login", { username: $("username").value, password: $("password").value });
-    $("password").value = "";
-    applySession(res);
-    showApp(res.username);
-    await loadReport();
-  } catch (e) {
-    showLogin(e.message);
-  } finally {
-    btn.disabled = false;
-    btn.textContent = "Sign in";
-  }
-});
-
 $("btn-refresh").addEventListener("click", loadReport);
-
-$("btn-show-login").addEventListener("click", () => showLogin($("login-error").hidden ? null : $("login-error").textContent));
-
-$("btn-logout").addEventListener("click", async () => {
-  await postJSON("api/logout", {}).catch(() => {});
-  lastReport = null;
-  currentUser = null;
-  tokenExpiration = null;
-  $("devices").replaceChildren();
-  $("username").value = "";
-  showLogin();
-});
 
 $("btn-download").addEventListener("click", () => {
   if (!lastReport) return;
@@ -1327,17 +1322,15 @@ $("btn-download").addEventListener("click", () => {
 });
 
 (async () => {
+  $("app-view").hidden = false;
+  $("toolbar").hidden = false;
   try {
-    const s = await api("api/session");
-    applySession(s);
-    if (s.logged_in) {
-      showApp(s.username);
-      const { report } = await api("api/report/latest");
-      if (report) { lastReport = report; renderReport(report); }
-      else await loadReport();
-    }
-    else showLogin();
+    applySession(await api("api/session"));
+    const { report } = await api("api/report/latest");
+    if (report) { lastReport = report; renderReport(report); }
+    else await loadReport();
   } catch (e) {
-    showLogin(e.message);
+    showAppError(e.message);
   }
+  startAutoUpdate();
 })();

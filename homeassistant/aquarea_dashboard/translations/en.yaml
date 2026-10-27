@@ -1,16 +1,16 @@
 configuration:
   poll_minutes:
     name: Update interval (minutes)
-    description: How often the heat pump data is fetched and appended to history.csv.
+    description: How often the HeishaMon values are appended to history.csv and the automatic functions run (live values update continuously).
   allow_control:
     name: Allow control
     description: Allow changing the heat pump from the dashboard (heating target/shift, power, quiet mode) and the automatic functions (tuning, night-time shutoff, quiet auto). Read-only when disabled.
   debug:
     name: Debug logging
-    description: Verbose logging (includes Panasonic API details).
+    description: Verbose logging (includes MQTT details).
   ha_sensors:
     name: Home Assistant temperature sensors
     description: Entity IDs (e.g. sensor.flow_temperature) to show and record. Empty = all temperature sensors (max. 12).
-  heat_curve:
-    name: Zone 1 heating curve
-    description: "Outdoor °C : water target °C points, e.g. 5:30,-7:34. Used to show the target water temperature (curve + shift)."
+  mqtt_base_topic:
+    name: HeishaMon MQTT base topic
+    description: "The base topic set in HeishaMon (default panasonic_heat_pump). The broker comes from the Mosquitto app."
