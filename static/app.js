@@ -344,7 +344,6 @@ function buildQuietAutoView(deviceId) {
   const numberInput = (min, max, step) => el("input", { type: "number", min, max, step });
   const f = {
     enabled: el("input", { type: "checkbox" }),
-    threshold: numberInput("-20", "20", "0.5"),
     advanced: el("input", { type: "checkbox" }),
     release_k: numberInput("0", "10", "0.5"),
     defrost: el("input", { type: "checkbox" }),
@@ -355,8 +354,7 @@ function buildQuietAutoView(deviceId) {
   const save = el("button", { type: "button", text: "Save" });
   const status = el("div", { class: "sub" });
   const form = el("div", { class: "quiet-form" },
-    check(f.enabled, "Auto"),
-    field("Threshold outdoor °C (below: 0, above: 3)", f.threshold),
+    check(f.enabled, "Auto (cold: 0, see Outdoor thresholds; otherwise 3)"),
     check(f.advanced, "Advanced: 3 after each compressor stop"),
     field("Back to 0 at water ≥ target − K", f.release_k),
     check(f.defrost, "Quiet 0 after a defrost"),
@@ -374,7 +372,7 @@ function buildQuietAutoView(deviceId) {
   function setValues(s) {
     settings = s;
     for (const k of ["enabled", "advanced", "defrost"]) f[k].checked = s[k];
-    for (const k of ["threshold", "release_k", "defrost_until"]) f[k].value = String(s[k]);
+    for (const k of ["release_k", "defrost_until"]) f[k].value = String(s[k]);
     dirty = false;
   }
 
@@ -392,7 +390,6 @@ function buildQuietAutoView(deviceId) {
   save.addEventListener("click", async () => {
     const body = {
       enabled: f.enabled.checked,
-      threshold: Number(f.threshold.value),
       advanced: f.advanced.checked,
       release_k: Number(f.release_k.value),
       defrost: f.defrost.checked,
@@ -615,14 +612,25 @@ function historyChart(rows) {
   const W = narrow ? 340 : 900, L = narrow ? 60 : 48, R = haKeys.length ? (narrow ? 40 : 48) : 16, T = 12, plotH = narrow ? 160 : 220, bandH = 14, bandGap = 6;
   const xTicks = narrow ? 3 : 6;
   // Average power between consecutive changes of today's kWh total (the cloud
-  // updates it in steps); the first step after a start/reset has no known start.
+  // updates it in steps); the first step after a start has no known start. After
+  // the reset at local midnight the total counts from midnight.
   const power = [];
   let prevE = null, lastChange = null;
   for (const p of pts) {
     const e = p.energy_today_kwh;
     if (typeof e !== "number") continue;
     if (prevE !== null && e < prevE.energy_today_kwh) {
-      lastChange = null; // new day
+      const midnight = new Date(p.t).setHours(0, 0, 0, 0);
+      if (prevE.t < midnight) { // new day
+        if (e > 0 && p.t > midnight) {
+          power.push({ from: midnight, to: p.t, kw: e / ((p.t - midnight) / 3_600_000) });
+          lastChange = p;
+        } else {
+          lastChange = { t: midnight };
+        }
+      } else {
+        lastChange = null;
+      }
     } else if (prevE !== null && e !== prevE.energy_today_kwh) {
       if (lastChange) power.push({ from: lastChange.t, to: p.t, kw: (e - prevE.energy_today_kwh) / ((p.t - lastChange.t) / 3_600_000) });
       lastChange = p;
@@ -810,6 +818,82 @@ function historyChart(rows) {
     explain("compressor", `* Compressor estimated: OFF when operation is off, ON in defrost. Panasonic thermostat: OFF when Zone 1 water ≥ target + ${THERMO_OFF_K} K for ${THERMO_MS / 60_000} min (highest target of the last ${TARGET_UPDATE_MS / 60_000} min, since the unit's update time is unknown). Zone 1 water rising ${WATER_STEP_K} K above its low since the last change (e.g. the uptick after the pump-start dip) = ON, falling ${WATER_STEP_K} K below its high = OFF. Otherwise 15-min avg power ≥ ${COMPRESSOR_ON_KW * 1000} W = ON, ≤ ${COMPRESSOR_OFF_KW * 1000} W = OFF (ignored for ${POWER_LAG_MIN} min after a water-detected change, as the kWh total lags). Th.off: light = water within 1 K of target + ${THERMO_OFF_K} K (lowest possible target), dark = at/above it for the highest possible target (3-min timer running).`, "* Compressor estimate"));
 }
 
+// ------------------------------------------------------------------ outdoor thresholds
+// Shared by quiet auto and tuning; cached per device like the tuning view.
+const outdoorViews = new Map();
+
+function outdoorSection(dev) {
+  if (!dev.outdoor) return null;
+  const deviceId = dev.info.device_id;
+  let view = outdoorViews.get(deviceId);
+  if (!view) {
+    view = buildOutdoorView(deviceId);
+    outdoorViews.set(deviceId, view);
+  }
+  view.update(dev.outdoor);
+  return view.details;
+}
+
+function buildOutdoorView(deviceId) {
+  const f = {
+    cold_threshold: el("input", { type: "number", min: "-20", max: "20", step: "0.5" }),
+    cold_release: el("input", { type: "number", min: "-20", max: "20", step: "0.5" }),
+  };
+  const field = (label, input, hint) =>
+    el("label", {}, el("span", { text: label }), input, el("small", { class: "muted", text: hint }));
+  const save = el("button", { type: "button", text: "Save" });
+  const status = el("p", { class: "muted" });
+  const details = section("Outdoor thresholds (quiet auto + tuning)", el("div", {},
+    el("div", { class: "tuning-form" },
+      field("Cold at or below °C", f.cold_threshold, "quiet auto: 0; tuning: off at the next +1 step"),
+      field("Back on at or above °C", f.cold_release, "ends the cold lock of both")),
+    allowControl ? el("div", { class: "control-row" }, save) : null,
+    status));
+  let dirty = false;
+  for (const input of Object.values(f)) {
+    input.disabled = !allowControl;
+    input.addEventListener("input", () => { dirty = true; });
+  }
+  const time = (iso) => new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+
+  function setValues(s) {
+    for (const k of Object.keys(f)) f[k].value = String(s[k]);
+    dirty = false;
+  }
+
+  function render(o) {
+    const lock = (v) => (v ? `cold since ${time(v)}` : "not cold");
+    status.textContent = `Quiet auto: ${lock(o.quiet_cold_lock)} · Tuning: ${lock(o.tuning_cold_lock)}`;
+  }
+
+  save.addEventListener("click", async () => {
+    const body = { cold_threshold: Number(f.cold_threshold.value), cold_release: Number(f.cold_release.value) };
+    save.disabled = true;
+    save.textContent = "Saving…";
+    try {
+      const res = await postJSON("api/outdoor", { device_id: deviceId, settings: body });
+      const dev = lastReport?.devices?.find((d) => d.info?.device_id === deviceId);
+      if (dev) dev.outdoor = res.outdoor;
+      setValues(res.outdoor.settings);
+      render(res.outdoor);
+    } catch (e) {
+      if (e.status === 401) return showLogin(e.message);
+      showAppError(e.message);
+    } finally {
+      save.disabled = false;
+      save.textContent = "Save";
+    }
+  });
+
+  return {
+    details,
+    update(o) {
+      if (!dirty) setValues(o.settings);
+      render(o);
+    },
+  };
+}
+
 // ------------------------------------------------------------------ tuning
 // Cached per device so open state and unsaved edits survive the 1-min re-render.
 const tuningViews = new Map();
@@ -848,7 +932,6 @@ function buildTuningView(deviceId) {
     up_wait_pct: numberInput("0", "100", "5"),
     max_pause_min: numberInput("0", "300", "10"),
     indoor_target: numberInput("15", "28", "0.1"),
-    min_outdoor: numberInput("-25", "20", "0.5"),
     night_start: el("input", { type: "time" }),
     night_end: el("input", { type: "time" }),
     indoor_sensor: el("select"),
@@ -884,7 +967,6 @@ function buildTuningView(deviceId) {
       "a +1 step waits this share of the time the water took for its last degree; 0 = at once; at target + 3 K always at once"),
     field("Max. compressor pause, min.", f.max_pause_min, "then, if the room is at or below target, a shift below normal goes back to normal; 0 = off"),
     field("Indoor target °C", f.indoor_target, "warmer = down mode"),
-    field("Min. outdoor °C", f.min_outdoor, "colder = no tuning, normal shift"),
     field("Night from", f.night_start),
     field("Night until", f.night_end),
     field("Indoor sensor", f.indoor_sensor),
@@ -926,8 +1008,9 @@ function buildTuningView(deviceId) {
       "If the compressor stays off longer than the maximum pause with the shift lowered and the room is not " +
       "warmer than the indoor target, the shift goes back to normal so it restarts on its own (no shift down again " +
       "until it has run). " +
-      "Below the minimum outdoor temperature tuning is off and the shift " +
-      "stays at normal. A shift changed elsewhere pauses tuning. Night-time shutoff turns the whole unit (including " +
+      "When a +1 step is due with the outdoor temperature at or below the cold threshold (Outdoor thresholds), " +
+      "tuning goes off instead: the shift goes back to normal and stays there (no up or down steps) until the " +
+      "outdoor temperature is back at or above the release temperature. A shift changed elsewhere pauses tuning. Night-time shutoff turns the whole unit (including " +
       "hot water) off for the night hours when the forecast mean of the following day is above the threshold and " +
       "the night minimum is not below its limit, and back on at the end of the night. It turns the unit off only " +
       "when the compressor has been off for the wait time (a run is not cut short); when it is back on in the " +
@@ -986,7 +1069,7 @@ function buildTuningView(deviceId) {
     f.night_off_dynamic.checked = s.night_off_dynamic;
     f.night_off_gate.checked = s.night_off_gate;
     f.early_off_auto.checked = s.early_off_auto;
-    for (const k of ["normal_shift", "up_max", "down_max", "min_run_min", "up_wait_pct", "max_pause_min", "indoor_target", "min_outdoor", "night_start", "night_end",
+    for (const k of ["normal_shift", "up_max", "down_max", "min_run_min", "up_wait_pct", "max_pause_min", "indoor_target", "night_start", "night_end",
       "night_off_min_mean", "night_off_min_low", "night_off_early_min", "night_off_early_wait_min", "night_off_trend_min", "night_off_gate_temp", "early_off_auto_temp",
       "night_off_gate_time", "night_off_dynamic_from", "night_off_dynamic_until", "night_off_dynamic_margin"]) f[k].value = String(s[k]);
     fillSensors(s.indoor_sensor);
@@ -1021,7 +1104,7 @@ function buildTuningView(deviceId) {
         ? `${t.commands.hour}/${t.commands.max_hour} last hour \u00b7 ${t.commands.day}/${t.commands.max_day} last 24 h`
         : "–"],
       ["Indoor", typeof live.indoor === "number" ? `${live.indoor} °C (target ${t.settings.indoor_target} °C)` : "–"],
-      ["Outdoor", typeof live.outdoor === "number" ? `${live.outdoor} °C (min. ${t.settings.min_outdoor} °C)` : "–"],
+      ["Outdoor", typeof live.outdoor === "number" ? `${live.outdoor} °C` : "–"],
       ["Room cooling (learned)", coolingText(t.cooling)],
       ["Compressor (est.)", st.compressor ?? "–"],
       ["Water heating", typeof st.water_degree_min === "number"
@@ -1057,7 +1140,6 @@ function buildTuningView(deviceId) {
       up_wait_pct: Number(f.up_wait_pct.value),
       max_pause_min: Number(f.max_pause_min.value),
       indoor_target: Number(f.indoor_target.value),
-      min_outdoor: Number(f.min_outdoor.value),
       night_start: f.night_start.value,
       night_end: f.night_end.value,
       indoor_sensor: f.indoor_sensor.value,
@@ -1159,6 +1241,8 @@ function renderReport(report) {
         el("p", { class: "muted", text: "Values marked “device list” come from the device overview instead." })));
     }
     container.append(section("History", historyView(dev.info.device_id), true));
+    const outdoor = outdoorSection(dev);
+    if (outdoor) container.append(outdoor);
     const tuning = tuningSection(dev);
     if (tuning) container.append(tuning);
     if (dev.consumption) container.append(section("Energy consumption", energyView(dev.consumption), true));

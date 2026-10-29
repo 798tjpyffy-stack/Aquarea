@@ -89,21 +89,32 @@ def defrost_hold_until(rows: list[dict[str, Any]], now: dt.datetime, defrost_now
 
 def power_segments(rows: list[dict[str, Any]], times: list[float]) -> list[PowerSegment]:
     """Average power between consecutive changes of today's kWh total (the cloud
-    updates it in steps); the first step after a start/reset has no known start."""
+    updates it in steps); the first step after a start has no known start. After
+    the reset at local midnight the total counts from midnight."""
     segments: list[PowerSegment] = []
     prev_e: float | None = None
+    prev_t: float | None = None
     last_change: float | None = None
     for row, t in zip(rows, times):
         e = _num(row.get("energy_today_kwh"))
         if e is None:
             continue
         if prev_e is not None and e < prev_e:
-            last_change = None  # new day
+            day = dt.datetime.fromtimestamp(t / 1000).date()
+            midnight = dt.datetime.combine(day, dt.time()).timestamp() * 1000
+            if prev_t is not None and prev_t < midnight:  # new day
+                if e > 0 and t > midnight:
+                    segments.append(PowerSegment(midnight, t, e / ((t - midnight) / 3_600_000)))
+                    last_change = t
+                else:
+                    last_change = midnight
+            else:
+                last_change = None
         elif prev_e is not None and e != prev_e:
             if last_change is not None:
                 segments.append(PowerSegment(last_change, t, (e - prev_e) / ((t - last_change) / 3_600_000)))
             last_change = t
-        prev_e = e
+        prev_e, prev_t = e, t
     return segments
 
 

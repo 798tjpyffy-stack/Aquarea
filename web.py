@@ -261,6 +261,7 @@ async def refresh_report(
                 _LOGGER.exception("Tuning failed for %s", device_id)
             dev["tuning"] = _tuning_public(app, device_id)
             dev["quiet_auto"] = app[TUNER].public_quiet(device_id)
+            dev["outdoor"] = app[TUNER].public_outdoor(device_id)
     return report
 
 
@@ -808,6 +809,36 @@ async def api_quiet_auto(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "quiet_auto": tuner.public_quiet(device_id)})
 
 
+async def api_outdoor(request: web.Request) -> web.Response:
+    """Save the shared outdoor settings (cold threshold / release) for a device."""
+    if not request.app[ALLOW_CONTROL]:
+        return web.json_response(
+            {"error": "Control is disabled. Start the server with --allow-control."}, status=403
+        )
+    _require_json(request)
+    session = _get_session(request)
+    if session is None:
+        return web.json_response({"error": "Not logged in."}, status=401)
+    try:
+        body = await request.json()
+    except ValueError:
+        raise web.HTTPBadRequest(text="Invalid JSON")
+    if not isinstance(body, dict):
+        return web.json_response({"error": "JSON object required."}, status=400)
+    device_id = body.get("device_id")
+    known = {d.get("info", {}).get("device_id") for d in (session.last_report or {}).get("devices", [])}
+    if not isinstance(device_id, str) or device_id not in known:
+        return web.json_response({"error": "Unknown device."}, status=404)
+    try:
+        settings = tuning.validate_outdoor(body.get("settings"))
+    except ValueError as ex:
+        return web.json_response({"error": str(ex)}, status=400)
+    _LOGGER.warning("CONTROL %s: outdoor device %s settings %s", session.client.username, device_id, settings)
+    tuner = request.app[TUNER]
+    tuner.update_outdoor(device_id, settings, dt.datetime.now().astimezone())
+    return web.json_response({"ok": True, "outdoor": tuner.public_outdoor(device_id)})
+
+
 async def api_tuning(request: web.Request) -> web.Response:
     """Save hysteresis tuning settings for a device."""
     if not request.app[ALLOW_CONTROL]:
@@ -974,6 +1005,7 @@ def create_app(
     app.router.add_post("/api/device/power", api_device_power)
     app.router.add_post("/api/device/quiet-mode", api_device_quiet_mode)
     app.router.add_post("/api/quiet-auto", api_quiet_auto)
+    app.router.add_post("/api/outdoor", api_outdoor)
     app.router.add_post("/api/tuning", api_tuning)
     app.router.add_post("/api/early-off", api_early_off)
     app.router.add_static("/static/", STATIC_DIR)

@@ -271,6 +271,9 @@ async def gather_consumption(
 ) -> dict[str, Any]:
     """Fetch consumption for today (hourly), this month (daily), this year (monthly)."""
     today = dt.date.today()
+    # aioaquarea sends osTimezone +00:00 with a local date, so Panasonic counts UTC days
+    # (consumption between local midnight and 01:00/02:00 was missing); use the local offset
+    client._consumption_manager._timezone = dt.datetime.now().astimezone().tzinfo  # noqa: SLF001
     requests = {
         "day": (DateType.DAY, today.strftime("%Y%m%d")),
         "month": (DateType.MONTH, today.strftime("%Y%m01")),
