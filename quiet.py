@@ -1,8 +1,9 @@
 """Automatic quiet mode level from the outdoor temperature.
 
-Basic: outdoor below the threshold -> quiet 0, above -> quiet 3 (at the
-threshold the level is kept, as the unit reports whole degrees).
-Advanced (above the threshold): quiet 3 after each compressor stop, back to 0
+Basic: outdoor at or below the cold threshold (shared outdoor settings, see
+tuning.DEFAULT_OUTDOOR) -> quiet 0, which stays until the outdoor temperature is
+back at or above cold_release (cold lock); otherwise quiet 3.
+Advanced (not cold): quiet 3 after each compressor stop, back to 0
 once the compressor runs and the water reaches target - release_k.
 Defrost: after a defrost quiet stays 0 until the outdoor temperature reaches
 defrost_until.
@@ -18,7 +19,6 @@ from typing import Any, Callable
 
 DEFAULT_QUIET: dict[str, Any] = {
     "enabled": False,
-    "threshold": 2,
     "advanced": False,
     "release_k": 2,
     "defrost": True,
@@ -55,7 +55,6 @@ def validate_quiet(body: Any) -> dict[str, Any]:
             raise ValueError(f"{key} must be true or false.")
     return {
         "enabled": body["enabled"],
-        "threshold": _float(body["threshold"], "threshold", -20, 20),
         "advanced": body["advanced"],
         "release_k": _float(body["release_k"], "release_k", 0, 10),
         "defrost": body["defrost"],
@@ -92,8 +91,11 @@ def _pause(s: dict[str, Any], st: dict[str, Any], reason: str, log: Log) -> None
     log("quiet", f"Quiet auto paused: {reason}")
 
 
-def decide(q: dict[str, Any], live: dict[str, Any], obs: Any, log: Log) -> QuietCommand | None:
-    """Next quiet level command for the observation (tuning.Observation), or None."""
+def decide(
+    q: dict[str, Any], outdoor: dict[str, Any], live: dict[str, Any], obs: Any, log: Log
+) -> QuietCommand | None:
+    """Next quiet level command for the observation (tuning.Observation), or None.
+    outdoor: shared settings cold_threshold / cold_release."""
     s, st, now = q["settings"], q["state"], obs.now
     prev_comp = st.get("compressor")
     if obs.compressor is not None:
@@ -155,20 +157,24 @@ def decide(q: dict[str, Any], live: dict[str, Any], obs: Any, log: Log) -> Quiet
         adv_why = "after compressor stop until the water nears the target" if adv == 3 else "compressor running"
     st["adv_level"] = adv
 
-    out, thr = obs.outdoor, s["threshold"]
+    # Cold lock: quiet 0 from the cold threshold until the outdoor temperature reaches cold_release
+    out, thr, rel = obs.outdoor, outdoor["cold_threshold"], outdoor["cold_release"]
+    if st.get("cold_lock") and out is not None and out >= rel:
+        st.pop("cold_lock")
+        log("quiet", f"Cold lock released: outdoor {_n(out)} °C ≥ {_n(rel)} °C")
+    elif not st.get("cold_lock") and out is not None and out <= thr:
+        st["cold_lock"] = _iso(now)
+        log("quiet", f"Cold: outdoor {_n(out)} °C ≤ {_n(thr)} °C, quiet mode 0 until outdoor ≥ {_n(rel)} °C")
     if st.get("defrost_lock"):
         want, why = 0, f"after defrost, until outdoor ≥ {_n(s['defrost_until'])} °C"
+    elif st.get("cold_lock"):
+        want, why = 0, f"cold (outdoor {_n(out)} °C), until outdoor ≥ {_n(rel)} °C"
     elif out is None:
         want, why = None, "outdoor temperature unavailable"
-    elif out < thr:
-        want, why = 0, f"outdoor {_n(out)} °C < {_n(thr)} °C"
-    elif out > thr:
-        if s["advanced"]:
-            want, why = adv, f"outdoor {_n(out)} °C > {_n(thr)} °C, {adv_why}"
-        else:
-            want, why = 3, f"outdoor {_n(out)} °C > {_n(thr)} °C"
+    elif s["advanced"]:
+        want, why = adv, f"outdoor {_n(out)} °C > {_n(thr)} °C, {adv_why}"
     else:
-        want, why = None, f"outdoor at threshold {_n(thr)} °C: level kept"
+        want, why = 3, f"outdoor {_n(out)} °C > {_n(thr)} °C"
     live["note"] = why if want is None else f"level {want}: {why}"
     live["want"] = want
     if want is None or want == obs.quiet:

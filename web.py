@@ -153,6 +153,7 @@ async def refresh_report(app: web.Application) -> dict[str, Any]:
         _LOGGER.exception("Tuning failed for %s", device_id)
     dev["tuning"] = _tuning_public(app, device_id)
     dev["quiet_auto"] = app[TUNER].public_quiet(device_id)
+    dev["outdoor"] = app[TUNER].public_outdoor(device_id)
     app[STATE]["last_report"] = report
     return report
 
@@ -571,6 +572,22 @@ async def api_quiet_auto(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "quiet_auto": tuner.public_quiet(device_id)})
 
 
+async def api_outdoor(request: web.Request) -> web.Response:
+    """Save the shared outdoor settings (cold threshold / release)."""
+    body, error = await _control_body(request)
+    if error:
+        return error
+    try:
+        settings = tuning.validate_outdoor(body.get("settings"))
+    except ValueError as ex:
+        return web.json_response({"error": str(ex)}, status=400)
+    device_id = body["device_id"]
+    _LOGGER.warning("CONTROL: outdoor device %s settings %s", device_id, settings)
+    tuner = request.app[TUNER]
+    tuner.update_outdoor(device_id, settings, dt.datetime.now().astimezone())
+    return web.json_response({"ok": True, "outdoor": tuner.public_outdoor(device_id)})
+
+
 async def api_tuning(request: web.Request) -> web.Response:
     """Save hysteresis tuning settings."""
     body, error = await _control_body(request)
@@ -744,6 +761,7 @@ def create_app(
     app.router.add_post("/api/device/power", api_device_power)
     app.router.add_post("/api/device/quiet-mode", api_device_quiet_mode)
     app.router.add_post("/api/quiet-auto", api_quiet_auto)
+    app.router.add_post("/api/outdoor", api_outdoor)
     app.router.add_post("/api/tuning", api_tuning)
     app.router.add_post("/api/early-off", api_early_off)
     app.router.add_static("/static/", STATIC_DIR)

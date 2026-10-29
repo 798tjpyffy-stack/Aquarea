@@ -72,8 +72,11 @@ section changes the curve shift automatically to lengthen compressor runs:
   off this long with the shift below normal (shift down) and the room is not
   warmer than the indoor target, the shift returns to normal so the compressor
   restarts on its own; it is not lowered again until the compressor has run.
-- Below the *min. outdoor* temperature (default 0 °C) tuning is off and the
-  shift returns to normal.
+- **Cold** (see *Outdoor thresholds*): the outdoor temperature only matters
+  when a +1 step is due. At or below the cold threshold no step is made;
+  tuning goes off instead, the shift returns to normal and stays there (no up
+  or down steps) until the outdoor temperature is back at or above the release
+  temperature.
 - During a defrost and for 10 minutes after it, tuning and the night-time
   shutoff take no action (quiet mode auto still does). The compressor counts as
   running throughout, so a defrost is no extra start, and the lower water
@@ -212,9 +215,10 @@ It does not start while a shutoff night has the unit off.
 "Auto settings" in the Quiet mode tile sets the quiet level from the outdoor
 temperature reported by the unit (checked on every update):
 
-- below the threshold (default 2 °C) quiet 0, above it quiet 3; exactly at the
-  threshold the level is kept (the unit reports whole degrees).
-- **Advanced**: above the threshold, quiet 3 after each compressor stop and back
+- at or below the cold threshold (see *Outdoor thresholds*) quiet 0, which
+  stays until the outdoor temperature is back at or above the release
+  temperature; otherwise quiet 3.
+- **Advanced**: when not cold, quiet 3 after each compressor stop and back
   to 0 once the compressor runs and the water reaches target − K (default 2 K).
 - **Quiet 0 after a defrost**: after a defrost, quiet stays 0 until the outdoor
   temperature reaches the set value (default 5 °C).
@@ -229,3 +233,11 @@ and the restart rule learned from the last 20 restarts: the water outlet at
 restart relative to the target or to the inlet at stop − 3 K, whichever is
 more consistent, with an expected restart time once it is reliable (at least
 5 restarts, spread ≤ 0.5 K). Stops not explained by the timer are logged.
+
+## Outdoor thresholds
+
+Shared by quiet mode auto and the tuning (section "Outdoor thresholds"):
+**cold at or below** (default 2 °C) and **back on at or above** (default
+4 °C, must be higher). The gap keeps a flickering outdoor reading from
+switching back and forth. The section shows whether quiet auto and tuning are
+currently cold-locked.

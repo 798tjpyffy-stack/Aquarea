@@ -18,8 +18,10 @@ normal + up_max); after that the shift goes back to normal and the compressor
 stops on its own. If the compressor stays off longer than max_pause_min with
 the shift below normal and the room not warmer than the indoor target, the shift
 goes back to normal so that it restarts on its own (no shift down again until
-the compressor has run). Below the outdoor
-threshold min_outdoor tuning is off and the shift goes back to normal.
+the compressor has run). Cold (shared outdoor settings, DEFAULT_OUTDOOR): the
+outdoor temperature only matters when a +1 step is due; at or below cold_threshold
+tuning goes off instead (cold lock: shift back to normal, no up or down steps) until
+the outdoor temperature is back at or above cold_release.
 The +1 step follows the unit's thermo off timer (thermo.ThermoWatch, from the
 live HeishaMon values): the unit stops 3 min after the outlet first went above
 target + 3 K (continuously, same target); the step is sent step_lead_s before
@@ -113,7 +115,6 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "step_lead_s": 60,  # +1 step this many seconds before the unit's thermo off
     "max_pause_min": 180,  # shift below normal back to normal after the compressor is off this long; 0 = off
     "indoor_target": 22.5,
-    "min_outdoor": 0,  # below this outdoor °C no tuning; shift back to normal
     "night_start": "22:00",
     "night_end": "10:00",
     "indoor_sensor": "sensor.lumi_lumi_weather_temperatur",
@@ -135,6 +136,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "early_off_auto": True,  # early off while the room is warmer than early_off_auto_temp
     "early_off_auto_temp": 23.0,  # °C; lasts until the room is below indoor_target
 }
+# shared by quiet auto and tuning: cold at or below cold_threshold, back at or above cold_release
+DEFAULT_OUTDOOR: dict[str, Any] = {"cold_threshold": 2.0, "cold_release": 4.0}
 LOG_LIMIT = 200
 PUBLIC_LOG = 20
 MIN_STEP_LEAD_S, MAX_STEP_LEAD_S = 20, 150
@@ -191,9 +194,6 @@ def validate_settings(body: Any) -> dict[str, Any]:
     indoor = body["indoor_target"]
     if isinstance(indoor, bool) or not isinstance(indoor, (int, float)) or not 15 <= indoor <= 28:
         raise ValueError("indoor_target must be a number between 15 and 28.")
-    min_outdoor = body["min_outdoor"]
-    if isinstance(min_outdoor, bool) or not isinstance(min_outdoor, (int, float)) or not -25 <= min_outdoor <= 20:
-        raise ValueError("min_outdoor must be a number between -25 and 20.")
     for key in ("night_start", "night_end", "night_off_gate_time", "night_off_dynamic_from", "night_off_dynamic_until"):
         if not isinstance(body[key], str) or not _TIME_RE.match(body[key]):
             raise ValueError(f"{key} must be a time HH:MM.")
@@ -221,7 +221,6 @@ def validate_settings(body: Any) -> dict[str, Any]:
         "step_lead_s": _int(body["step_lead_s"], "step_lead_s", MIN_STEP_LEAD_S, MAX_STEP_LEAD_S),
         "max_pause_min": _int(body["max_pause_min"], "max_pause_min", 0, 300),
         "indoor_target": round(float(indoor), 1),
-        "min_outdoor": round(float(min_outdoor), 1),
         "night_start": body["night_start"],
         "night_end": body["night_end"],
         "indoor_sensor": body["indoor_sensor"],
@@ -243,6 +242,17 @@ def validate_settings(body: Any) -> dict[str, Any]:
         "early_off_auto": body["early_off_auto"],
         "early_off_auto_temp": auto_temp,
     }
+
+
+def validate_outdoor(body: Any) -> dict[str, Any]:
+    """Shared outdoor settings; raises ValueError with a user message."""
+    if not isinstance(body, dict) or set(body) != set(DEFAULT_OUTDOOR):
+        raise ValueError(f"settings must have exactly {sorted(DEFAULT_OUTDOOR)}.")
+    thr = _float(body["cold_threshold"], "cold_threshold", -20, 20)
+    rel = _float(body["cold_release"], "cold_release", -20, 20)
+    if rel <= thr:
+        raise ValueError("cold_release must be above cold_threshold.")
+    return {"cold_threshold": thr, "cold_release": rel}
 
 
 def _minutes(hhmm: str) -> int:
@@ -477,6 +487,7 @@ class Tuner:
                 stored = dict(entry.get("settings") or {})
                 stored.pop("night_off_max_mean", None)  # replaced by night_off_min_mean (0.1.21)
                 stored.pop("up_wait_pct", None)  # replaced by step_lead_s (0.2.0)
+                stored.pop("min_outdoor", None)  # replaced by the shared outdoor settings (0.1.61)
                 settings = validate_settings({**DEFAULT_SETTINGS, **stored})
             except ValueError as ex:
                 _LOGGER.error("Invalid tuning settings for %s, using defaults: %s", device_id, ex)
@@ -484,17 +495,25 @@ class Tuner:
             state = entry.get("state") if isinstance(entry.get("state"), dict) else {}
             log = [e for e in entry.get("log") or [] if isinstance(e, dict)][-LOG_LIMIT:]
             q = entry.get("quiet") if isinstance(entry.get("quiet"), dict) else {}
+            q_stored = dict(q.get("settings") or {})
+            q_stored.pop("threshold", None)  # replaced by the shared outdoor settings (0.1.61)
             try:
-                q_settings = quiet.validate_quiet({**quiet.DEFAULT_QUIET, **(q.get("settings") or {})})
+                q_settings = quiet.validate_quiet({**quiet.DEFAULT_QUIET, **q_stored})
             except ValueError as ex:
                 _LOGGER.error("Invalid quiet auto settings for %s, using defaults: %s", device_id, ex)
                 q_settings = dict(quiet.DEFAULT_QUIET)
             q_state = q.get("state") if isinstance(q.get("state"), dict) else {}
+            try:
+                outdoor = validate_outdoor(entry.get("outdoor") or dict(DEFAULT_OUTDOOR))
+            except ValueError as ex:
+                _LOGGER.error("Invalid outdoor settings for %s, using defaults: %s", device_id, ex)
+                outdoor = dict(DEFAULT_OUTDOOR)
             result[device_id] = {
                 "settings": settings,
                 "state": state,
                 "log": log,
                 "quiet": {"settings": q_settings, "state": q_state},
+                "outdoor": outdoor,
             }
         return result
 
@@ -518,6 +537,7 @@ class Tuner:
                 "state": {},
                 "log": [],
                 "quiet": {"settings": dict(quiet.DEFAULT_QUIET), "state": {}},
+                "outdoor": dict(DEFAULT_OUTDOOR),
             },
         )
 
@@ -532,7 +552,7 @@ class Tuner:
             "settings": entry["settings"],
             "state": {
                 k: st.get(k)
-                for k in ("paused", "commanded", "confirmed", "compressor", "commanded_at", "resent")
+                for k in ("paused", "commanded", "confirmed", "compressor", "commanded_at", "resent", "cold_lock")
             },
             "live": self._live.get(device_id, {}),
             "log": entry["log"][-PUBLIC_LOG:],
@@ -618,6 +638,7 @@ class Tuner:
         if settings["enabled"] and not old["enabled"]:
             st.update(paused=None, commanded=None, confirmed=False, sent=False)
             st.pop("restore", None)
+            st.pop("cold_lock", None)
             self._log(entry, now, "enabled", "Tuning enabled")
         elif not settings["enabled"] and old["enabled"]:
             if st.get("sent"):
@@ -630,6 +651,25 @@ class Tuner:
         if changed:
             self._log(entry, now, "settings", "; ".join(changed))
         entry["settings"] = settings
+        self.save()
+
+    def public_outdoor(self, device_id: str) -> dict[str, Any]:
+        entry = self.entry(device_id)
+        return {
+            "settings": entry["outdoor"],
+            "quiet_cold_lock": entry["quiet"]["state"].get("cold_lock"),
+            "tuning_cold_lock": entry["state"].get("cold_lock"),
+        }
+
+    def update_outdoor(self, device_id: str, settings: dict[str, Any], now: dt.datetime) -> None:
+        entry = self.entry(device_id)
+        old = entry["outdoor"]
+        changed = [f"{k} {old[k]} → {settings[k]}" for k in settings if settings[k] != old[k]]
+        if not changed:
+            return
+        self._log(entry, now, "settings", "Outdoor: " + "; ".join(changed))
+        entry["outdoor"] = settings
+        self._quiet_live.pop(device_id, None)  # the note refers to the old settings
         self.save()
 
     def _pause(self, entry: dict[str, Any], now: dt.datetime, reason: str) -> None:
@@ -669,6 +709,20 @@ class Tuner:
         if obs.compressor is not None and obs.hold_until is None:
             st["compressor"] = obs.compressor
         ready = obs.curve_mode and obs.shift is not None and obs.limits is not None
+        o = entry["outdoor"]
+        if st.get("cold_lock") and obs.outdoor is not None and obs.outdoor >= o["cold_release"]:
+            st.pop("cold_lock")
+            self._log(
+                entry, now, "cold",
+                f"Cold lock released: outdoor {_n(obs.outdoor)} °C ≥ {_n(o['cold_release'])} °C, tuning on again",
+            )
+        lock = _parse(st.get("cold_lock"))
+        cold = (
+            f"cold since {lock.astimezone():%H:%M} (outdoor {_n(obs.outdoor)} °C), "
+            f"on again at ≥ {_n(o['cold_release'])} °C"
+            if lock
+            else None
+        )
 
         if not obs.unit_on:
             # nothing at all while the unit is off (no commands, restore or pause);
@@ -681,7 +735,9 @@ class Tuner:
         early_off = _early_off(st, now)
         if not s["enabled"]:
             st.pop("reset_after_on", None)
-            mode, why = self._mode(s, obs, _early_off_text(st) if early_off else None, self._night_down(entry, obs))
+            mode, why = self._mode(
+                s, obs, _early_off_text(st) if early_off else None, self._night_down(entry, obs), cold
+            )
             live["mode"] = "disabled"
             live["note"] = f"would be {mode}: {why}" if ready and obs.operation_on else (
                 "Zone 1 not in curve mode or status unavailable" if not ready else "heating off"
@@ -725,7 +781,7 @@ class Tuner:
         if not obs.operation_on:
             live["mode"], live["note"] = "idle", "heating off"
             return None
-        mode, why = self._mode(s, obs, _early_off_text(st) if early_off else None, self._night_down(entry, obs))
+        mode, why = self._mode(s, obs, _early_off_text(st) if early_off else None, self._night_down(entry, obs), cold)
         live["mode"], live["note"] = mode, why
         if not obs.control:
             live["note"] = f"{why} · control disabled (--allow-control)"
@@ -829,6 +885,17 @@ class Tuner:
                     f"{why} · thermo off timer running since {since:%H:%M:%S} (water above {threshold}): "
                     f"unit stops about {off_at:%H:%M:%S}, step at {step_at:%H:%M:%S}"
                 )
+            elif obs.outdoor is not None and obs.outdoor <= o["cold_threshold"]:
+                # cold: no step; tuning off (normal shift) until the outdoor temperature is back up
+                st["cold_lock"] = _iso(now)
+                why = (
+                    f"cold: outdoor {_n(obs.outdoor)} °C ≤ {_n(o['cold_threshold'])} °C at a +1 step, "
+                    f"on again at ≥ {_n(o['cold_release'])} °C"
+                )
+                self._log(entry, now, "cold", f"Tuning off ({why})")
+                live["mode"], live["note"] = "off", why
+                if obs.shift != normal:
+                    cmd = Command(normal, obs.shift, f"{why}: back to normal shift")
             else:
                 reason = (
                     f"thermo off timer: water {_n(obs.water)} °C above {threshold} since {since:%H:%M:%S}, "
@@ -898,10 +965,14 @@ class Tuner:
 
     @staticmethod
     def _mode(
-        s: dict[str, Any], obs: Observation, early_off: str | None = None, night_down: bool = False
+        s: dict[str, Any],
+        obs: Observation,
+        early_off: str | None = None,
+        night_down: bool = False,
+        cold: str | None = None,
     ) -> tuple[str, str]:
-        if obs.outdoor is not None and obs.outdoor < s["min_outdoor"]:
-            return "off", f"outdoor {_n(obs.outdoor)} °C < {_n(s['min_outdoor'])} °C"
+        if cold is not None:
+            return "off", cold
         if early_off is not None:
             return "down", early_off
         if night_down:
@@ -944,7 +1015,9 @@ class Tuner:
         st = q["state"]
         return {
             "settings": q["settings"],
-            "state": {k: st.get(k) for k in ("paused", "commanded", "confirmed", "defrost_lock", "adv_level")},
+            "state": {
+                k: st.get(k) for k in ("paused", "commanded", "confirmed", "defrost_lock", "adv_level", "cold_lock")
+            },
             "live": self._quiet_live.get(device_id, {}),
             "commands": {
                 "hour": len(quiet.sent_within(st, dt.datetime.now().astimezone(), dt.timedelta(hours=1))),
@@ -962,6 +1035,7 @@ class Tuner:
             return
         if settings["enabled"] != old["enabled"]:
             st.update(paused=None, commanded=None, confirmed=False)
+            st.pop("cold_lock", None)
             self._log(entry, now, "quiet", "Quiet auto " + ("enabled" if settings["enabled"] else "disabled"))
         changed = [f"quiet {k} {old[k]} → {settings[k]}" for k in settings if k != "enabled" and settings[k] != old[k]]
         if changed:
@@ -983,7 +1057,9 @@ class Tuner:
         before = json.dumps(entry, sort_keys=True)
         live = self._quiet_live[device_id] = {"checked_at": _iso(obs.now)}
         try:
-            return quiet.decide(entry["quiet"], live, obs, lambda ev, text: self._log(entry, obs.now, ev, text))
+            return quiet.decide(
+                entry["quiet"], entry["outdoor"], live, obs, lambda ev, text: self._log(entry, obs.now, ev, text)
+            )
         finally:
             if json.dumps(entry, sort_keys=True) != before:
                 self.save()
