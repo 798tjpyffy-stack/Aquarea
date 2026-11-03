@@ -14,8 +14,11 @@ than the target after the stop) also lowers the shift to normal − down_max.
 When the compressor starts again the shift returns to normal (also later while
 it runs, should that command have been skipped or failed). Until a run has
 lasted min_run_min the +1 steps are also made outside "up" mode (never above
-normal + up_max); after that the shift goes back to normal and the compressor
-stops on its own. If the compressor stays off longer than max_pause_min with
+normal + up_max); after that the shift is kept until the compressor stops on its
+own (only the cold lock resets it at once). From night_start until the first
+night_off_gate_time after it a room that needs heat gets "night" mode instead of
+"up": +1 steps only until the run reaches min_run_min (a warm room or a shutoff
+night is "down" as always). If the compressor stays off longer than max_pause_min with
 the shift below normal and the room not warmer than the indoor target, the shift
 goes back to normal so that it restarts on its own (no shift down again until
 the compressor has run). Cold (shared outdoor settings, DEFAULT_OUTDOOR): the
@@ -302,6 +305,21 @@ def night_window(settings: dict[str, Any], now: dt.datetime) -> tuple[dt.datetim
         start = at(today + dt.timedelta(days=1), settings["night_start"])
         end = at(today + dt.timedelta(days=1), settings["night_end"])
     return start, end
+
+
+def night_hours(settings: dict[str, Any], now: dt.datetime) -> str | None:
+    """Text "night <start>–<gate>" if now is between night_start and the first
+    night_off_gate_time after it (within the night), else None."""
+    window = night_window(settings, now)
+    if window is None or not window[0] <= now < window[1]:
+        return None
+    gt = settings["night_off_gate_time"]
+    gate_time = dt.time(int(gt[:2]), int(gt[3:]))
+    start_day = window[0].astimezone().date()
+    gate_at = dt.datetime.combine(start_day, gate_time).astimezone()
+    if gate_at <= window[0]:
+        gate_at = dt.datetime.combine(start_day + dt.timedelta(days=1), gate_time).astimezone()
+    return f"night {settings['night_start']}–{gt}" if now < gate_at else None
 
 
 def night_off_conditions(settings: dict[str, Any], fc: dict[str, Any] | None) -> tuple[bool, str]:
@@ -876,10 +894,9 @@ class Tuner:
         ):
             cmd = Command(normal - s["down_max"], obs.shift, f"compressor off, {why}: shift down")
         elif obs.compressor == "ON" and mode != "up" and not short and obs.shift > normal:
-            reason = f"no more heat needed ({why})"
-            if run_min is not None and s["min_run_min"]:
-                reason = f"min. run of {s['min_run_min']} min reached, no more heat needed ({why})"
-            cmd = Command(normal, obs.shift, reason)
+            # keep the raised shift: the compressor stops on its own, then back to normal / down
+            reached = f"min. run of {s['min_run_min']} min reached" if s["min_run_min"] else "no more heat needed"
+            live["note"] = f"{why} · {reached}: shift {obs.shift} kept until the compressor stops"
         elif (
             obs.compressor == "ON"
             and (mode == "up" or short)
@@ -983,6 +1000,9 @@ class Tuner:
             return "hold", "indoor temperature unavailable"
         if obs.indoor > s["indoor_target"]:
             return "down", f"indoor {_n(obs.indoor)} °C > {_n(s['indoor_target'])} °C"
+        night = night_hours(s, obs.now)
+        if night is not None:
+            return "night", f"{night}: shift up only until the min. run (indoor {_n(obs.indoor)} °C)"
         return "up", f"indoor {_n(obs.indoor)} °C ≤ {_n(s['indoor_target'])} °C"
 
     def record(self, device_id: str, cmd: Command, now: dt.datetime, error: str | None = None) -> None:

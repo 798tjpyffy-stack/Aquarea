@@ -259,23 +259,27 @@ def estimate(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def daily_stats(rows: list[dict[str, Any]], since: dt.datetime, max_gap: dt.timedelta) -> dict[str, Any]:
     """Compressor starts and running hours from `since` on, for rows already passed
-    through estimate() (in order, with context before `since`). A run that started
-    before `since` is not counted as a start; gaps longer than max_gap count as unknown,
-    unless the compressor runs on both sides of a gap up to BRIDGE_GAP."""
+    through estimate() (in order, with context before `since`). Only runs that started
+    at or after `since` count (starts and hours; a run across `since` belongs to the day
+    before); gaps longer than max_gap count as unknown, unless the compressor runs on
+    both sides of a gap up to BRIDGE_GAP."""
     start_ms, gap_ms = since.timestamp() * 1000, max_gap.total_seconds() * 1000
-    starts, on_ms, prev = 0, 0.0, None
+    starts, on_ms, prev, counted = 0, 0.0, None, False
     timed = [(t, r) for r in rows if (t := _ms(r)) is not None]
     for i, (t, r) in enumerate(timed):
         state = r.get("compressor")
         if state is None:
             continue
-        if state == "ON" and prev == "OFF" and t >= start_ms:
-            starts += 1
+        if state == "ON" and prev != "ON":
+            counted = prev == "OFF" and t >= start_ms
+            starts += counted
+        elif state != "ON":
+            counted = False
         prev = state
-        if state == "ON" and i + 1 < len(timed):
+        if counted and i + 1 < len(timed):
             nt, nr = timed[i + 1]
             if nt - t <= gap_ms or (nr.get("compressor") == "ON" and nt - t <= BRIDGE_GAP_MS):
-                on_ms += max(0.0, nt - max(t, start_ms))
+                on_ms += max(0.0, nt - t)
     hours = on_ms / 3_600_000
     return {
         "starts": starts,

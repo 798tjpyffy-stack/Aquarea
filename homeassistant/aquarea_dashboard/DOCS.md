@@ -51,8 +51,12 @@ section changes the curve shift automatically to lengthen compressor runs:
 - **Min. compressor run** (default 120 min, 0 = off): until a run has lasted
   this long, the shift also goes up near thermo off when no heat is needed
   (night, warm room), never above *normal + max. shift up* (so a run can still
-  end earlier). After that the shift returns to normal and the compressor stops
-  on its own.
+  end earlier). After that the shift is kept until the compressor stops on its
+  own (only the cold lock below resets it at once).
+- **Night hours**: from the start of the night (*Night from*) until the *6am
+  gate* time, a room that needs heat still gets the +1 steps only until the run
+  reaches the min. run (mode *night*), whether or not the night-time shutoff is
+  on. A warm room or a shutoff night shifts down as always.
 - **Up step wait** (default 85 %, 0 = at once): a +1 step waits this share of
   the time the water took for its last whole degree, counted from when it
   reached its current degree. A late step keeps the unit's own regulation from
@@ -188,8 +192,8 @@ made it too warm: **Early off** in the Operation tile starts a shutoff now,
 either until the end of the night hours or for a number of hours (default 12).
 It works like a shutoff night that starts now, without the forecast conditions
 and the night-time shutoff switch: the tuning runs in down mode (a running
-compressor still reaches the min. run, then the shift goes back to normal so it
-stops on its own, then down), the unit is turned off once the compressor has
+compressor still reaches the min. run, then keeps its shift until it stops on
+its own, then down), the unit is turned off once the compressor has
 been off for the wait time, and turned back on at the end (the shift goes back
 to normal). There is no max. pause reset during early off. If a shutoff night
 overlaps, the unit stays off in between. **End early off** turns a unit it
