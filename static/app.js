@@ -1023,7 +1023,9 @@ function buildTuningView(deviceId) {
       "(otherwise the room decides, e.g. after the 6am gate) or when the room is warmer than the indoor target " +
       "(also later while it is off, as soon as that applies); " +
       "when it starts again (or runs with the shift below normal), back to normal. Until a run reaches the minimum run time the shift also goes up in " +
-      "down mode (never above normal + max); after that it goes back to normal and the compressor stops on its own. " +
+      "down mode (never above normal + max); after that the shift is kept until the compressor stops on its own. " +
+      "From the start of the night until the 6am gate time a room that needs heat gets the up steps only until the " +
+      "minimum run time (night mode); a warm room or a shutoff night shifts down as always. " +
       "If the compressor stays off longer than the maximum pause with the shift lowered and the room is not " +
       "warmer than the indoor target, the shift goes back to normal so it restarts on its own (no shift down again " +
       "until it has run). " +
