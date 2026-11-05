@@ -52,7 +52,9 @@ section changes the curve shift automatically to lengthen compressor runs:
   this long, the shift also goes up near thermo off when no heat is needed
   (night, warm room), never above *normal + max. shift up* (so a run can still
   end earlier). After that the shift is kept until the compressor stops on its
-  own (only the cold lock below resets it at once).
+  own (only the cold lock below resets it at once). If the room is warmer than
+  the indoor target, the shift goes back to normal when the compressor is still
+  running 1 h after the last shift.
 - **Night hours**: from the start of the night (*Night from*) until the *6am
   gate* time, a room that needs heat still gets the +1 steps only until the run
   reaches the min. run (mode *night*), whether or not the night-time shutoff is

@@ -167,6 +167,9 @@ Rules:
   except "off" (never above normal + up_max).
 - After the minimum run (non-up modes) the **raised shift is kept until the
   compressor stops on its own** (0.1.62); only the cold lock resets at once.
+  Exception (0.1.64/0.2.4): room warmer than the indoor target and the
+  compressor still running `RAISED_KEEP_MAX` (1 h) after the last confirmed
+  shift command → back to normal.
   Before 0.1.62 it went back to normal immediately.
 - At a compressor **stop**: shift → normal, or normal − `down_max` (3) in
   down mode (lower target delays the next start). While off, a change to down
