@@ -6,7 +6,7 @@ back at or above cold_release (cold lock); otherwise quiet 3.
 Advanced (not cold): quiet 3 after each compressor stop, back to 0
 once the compressor runs and the water reaches target - release_k.
 Defrost: after a defrost quiet stays 0 until the outdoor temperature reaches
-defrost_until.
+cold_release.
 A level changed elsewhere (Panasonic app, unit, manual control) pauses the
 automatic mode.
 """
@@ -22,7 +22,6 @@ DEFAULT_QUIET: dict[str, Any] = {
     "advanced": False,
     "release_k": 2,
     "defrost": True,
-    "defrost_until": 5,
 }
 QUIET_LEVELS = (0, 1, 2, 3)
 CONFIRM_TIMEOUT = dt.timedelta(minutes=20)
@@ -58,7 +57,6 @@ def validate_quiet(body: Any) -> dict[str, Any]:
         "advanced": body["advanced"],
         "release_k": _float(body["release_k"], "release_k", 0, 10),
         "defrost": body["defrost"],
-        "defrost_until": _float(body["defrost_until"], "defrost_until", -20, 20),
     }
 
 
@@ -132,14 +130,15 @@ def decide(
             return None
 
     # Defrost lock
+    rel = outdoor["cold_release"]
     if st.get("defrost_lock") and (
-        not s["defrost"] or (not obs.defrost and obs.outdoor is not None and obs.outdoor >= s["defrost_until"])
+        not s["defrost"] or (not obs.defrost and obs.outdoor is not None and obs.outdoor >= rel)
     ):
         st["defrost_lock"] = False
         log("quiet", "Defrost lock released" + (f": outdoor {_n(obs.outdoor)} °C" if s["defrost"] else ""))
     if s["defrost"] and obs.defrost and not st.get("defrost_lock"):
         st["defrost_lock"] = True
-        log("quiet", f"Defrost detected: quiet mode 0 until outdoor ≥ {_n(s['defrost_until'])} °C")
+        log("quiet", f"Defrost detected: quiet mode 0 until outdoor ≥ {_n(rel)} °C")
 
     # Advanced: 3 after each compressor stop, 0 when the water is close to the target
     adv = st.get("adv_level", 0)
@@ -158,7 +157,7 @@ def decide(
     st["adv_level"] = adv
 
     # Cold lock: quiet 0 from the cold threshold until the outdoor temperature reaches cold_release
-    out, thr, rel = obs.outdoor, outdoor["cold_threshold"], outdoor["cold_release"]
+    out, thr = obs.outdoor, outdoor["cold_threshold"]
     if st.get("cold_lock") and out is not None and out >= rel:
         st.pop("cold_lock")
         log("quiet", f"Cold lock released: outdoor {_n(out)} °C ≥ {_n(rel)} °C")
@@ -166,7 +165,7 @@ def decide(
         st["cold_lock"] = _iso(now)
         log("quiet", f"Cold: outdoor {_n(out)} °C ≤ {_n(thr)} °C, quiet mode 0 until outdoor ≥ {_n(rel)} °C")
     if st.get("defrost_lock"):
-        want, why = 0, f"after defrost, until outdoor ≥ {_n(s['defrost_until'])} °C"
+        want, why = 0, f"after defrost, until outdoor ≥ {_n(rel)} °C"
     elif st.get("cold_lock"):
         want, why = 0, f"cold (outdoor {_n(out)} °C), until outdoor ≥ {_n(rel)} °C"
     elif out is None:

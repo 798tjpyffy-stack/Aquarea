@@ -366,7 +366,6 @@ function buildQuietAutoView(deviceId) {
     advanced: el("input", { type: "checkbox" }),
     release_k: numberInput("0", "10", "0.5"),
     defrost: el("input", { type: "checkbox" }),
-    defrost_until: numberInput("-20", "20", "0.5"),
   };
   const check = (input, text) => el("label", { class: "check" }, input, el("span", { text }));
   const field = (text, input) => el("label", {}, el("span", { text }), input);
@@ -376,8 +375,7 @@ function buildQuietAutoView(deviceId) {
     check(f.enabled, "Auto (cold: 0, see Outdoor thresholds; otherwise 3)"),
     check(f.advanced, "Advanced: 3 after each compressor stop"),
     field("Back to 0 at water ≥ target − K", f.release_k),
-    check(f.defrost, "Quiet 0 after a defrost"),
-    field("… until outdoor ≥ °C", f.defrost_until),
+    check(f.defrost, "Quiet 0 after a defrost (until the outdoor \u201cback on\u201d temperature)"),
     allowControl ? save : null);
   const details = el("details", {}, el("summary", { text: "Auto settings" }), form);
   const node = el("div", { class: "control" }, status, details);
@@ -391,7 +389,7 @@ function buildQuietAutoView(deviceId) {
   function setValues(s) {
     settings = s;
     for (const k of ["enabled", "advanced", "defrost"]) f[k].checked = s[k];
-    for (const k of ["release_k", "defrost_until"]) f[k].value = String(s[k]);
+    f.release_k.value = String(s.release_k);
     dirty = false;
   }
 
@@ -412,7 +410,6 @@ function buildQuietAutoView(deviceId) {
       advanced: f.advanced.checked,
       release_k: Number(f.release_k.value),
       defrost: f.defrost.checked,
-      defrost_until: Number(f.defrost_until.value),
     };
     if (body.enabled && !settings?.enabled &&
         !confirm("Enable quiet mode auto? The dashboard will change the quiet mode on its own.")) return;
@@ -867,7 +864,7 @@ function buildOutdoorView(deviceId) {
   const details = section("Outdoor thresholds (quiet auto + tuning)", el("div", {},
     el("div", { class: "tuning-form" },
       field("Cold at or below °C", f.cold_threshold, "quiet auto: 0; tuning: off at the next +1 step"),
-      field("Back on at or above °C", f.cold_release, "ends the cold lock of both")),
+      field("Back on at or above °C", f.cold_release, "ends the cold lock of both and the quiet 0 after a defrost")),
     allowControl ? el("div", { class: "control-row" }, save) : null,
     status));
   let dirty = false;

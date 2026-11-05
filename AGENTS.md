@@ -20,8 +20,8 @@ operation when it does not cost efficiency.
 
 | Branch | Version line | Data source | Status |
 | --- | --- | --- | --- |
-| `main` | 0.1.x (latest 0.1.62) | Panasonic Aquarea **cloud** via `aioaquarea` (polling) | deployed to HA, pushed |
-| `heishamon` | 0.2.x (latest 0.2.2) | **HeishaMon** over MQTT (local, live) | pushed, not yet deployed (owner deploys it on a weekend) |
+| `main` | 0.1.x (latest 0.1.65) | Panasonic Aquarea **cloud** via `aioaquarea` (polling) | deployed to HA, pushed |
+| `heishamon` | 0.2.x (latest 0.2.5) | **HeishaMon** over MQTT (local, live) | pushed, not yet deployed (owner deploys it on a weekend) |
 
 - `heishamon` branched from `16d0b43` (daily command limits) and replaced the
   cloud layer: `heishamon.py`, `thermo.py`, `energy.py` are new;
@@ -228,7 +228,8 @@ were replaced because they were less accurate.
 
 Cold → quiet 0 (cold lock), otherwise quiet 3. Advanced: quiet 3 after each
 stop, 0 once running and water ≥ target − `release_k`. After a defrost quiet 0
-until outdoor ≥ `defrost_until`.
+until outdoor ≥ `cold_release` (shared outdoor setting; was its own
+`defrost_until` 5 °C before 0.1.65/0.2.5).
 
 ### Statistics
 
