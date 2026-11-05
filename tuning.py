@@ -15,7 +15,9 @@ When the compressor starts again the shift returns to normal (also later while
 it runs, should that command have been skipped or failed). Until a run has
 lasted min_run_min the +1 steps are also made outside "up" mode (never above
 normal + up_max); after that the shift is kept until the compressor stops on its
-own (only the cold lock resets it at once). From night_start until the first
+own (only the cold lock resets it at once; with the room warmer than the indoor
+target it goes back to normal if the compressor still runs RAISED_KEEP_MAX after
+the last shift command). From night_start until the first
 night_off_gate_time after it a room that needs heat gets "night" mode instead of
 "up": +1 steps only until the run reaches min_run_min (a warm room or a shutoff
 night is "down" as always). If the compressor stays off longer than max_pause_min with
@@ -156,6 +158,9 @@ AUTO_EARLY_OFF_MAX = dt.timedelta(days=7)  # safety end of an auto early off
 HISTORY_WINDOW = dt.timedelta(hours=6)  # > the longest min_run_min / max_pause_min
 NEAR_K = THERMO_OFF_K - 1
 THERMO_OFF_AFTER = dt.timedelta(milliseconds=THERMO_MS)
+# room warmer than the indoor target, min. run reached: a raised shift is kept at most
+# this long after the last shift command if the compressor does not stop
+RAISED_KEEP_MAX = dt.timedelta(hours=1)
 _TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 _SENSOR_RE = re.compile(r"^sensor\.[a-z0-9_]{1,120}$")
 
@@ -873,9 +878,23 @@ class Tuner:
         ):
             cmd = Command(normal - s["down_max"], obs.shift, f"compressor off, {why}: shift down")
         elif obs.compressor == "ON" and mode != "up" and not short and obs.shift > normal:
-            # keep the raised shift: the compressor stops on its own, then back to normal / down
+            # keep the raised shift: the compressor stops on its own, then back to normal / down;
+            # with a warm room only up to RAISED_KEEP_MAX after the last shift command
             reached = f"min. run of {s['min_run_min']} min reached" if s["min_run_min"] else "no more heat needed"
-            live["note"] = f"{why} · {reached}: shift {obs.shift} kept until the compressor stops"
+            warm = obs.indoor is not None and obs.indoor > s["indoor_target"]
+            last = _parse(st.get("commanded_at")) if st.get("confirmed") else None
+            keep_min = int(RAISED_KEEP_MAX.total_seconds() // 60)
+            if warm and last is not None and now - last >= RAISED_KEEP_MAX:
+                cmd = Command(
+                    normal,
+                    obs.shift,
+                    f"{why} · {reached}, compressor still running {keep_min} min after the last shift: "
+                    "back to normal shift",
+                )
+            else:
+                live["note"] = f"{why} · {reached}: shift {obs.shift} kept until the compressor stops"
+                if warm and last is not None:
+                    live["note"] += f", at most until {(last + RAISED_KEEP_MAX).astimezone():%H:%M}"
         elif (
             obs.compressor == "ON"
             and (mode == "up" or short)
