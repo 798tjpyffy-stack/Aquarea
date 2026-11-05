@@ -219,7 +219,7 @@ temperature reported by the unit (checked on every update):
 - **Advanced**: when not cold, quiet 3 after each compressor stop and back
   to 0 once the compressor runs and the water reaches target − K (default 2 K).
 - **Quiet 0 after a defrost**: after a defrost, quiet stays 0 until the outdoor
-  temperature reaches the set value (default 5 °C).
+  temperature reaches the *back on* temperature (see *Outdoor thresholds*).
 
 A quiet level changed elsewhere (Panasonic app, unit, the Set button) pauses the
 automatic mode. At most 10 commands per hour.
@@ -229,5 +229,6 @@ automatic mode. At most 10 commands per hour.
 Shared by quiet mode auto and the tuning (section "Outdoor thresholds"):
 **cold at or below** (default 2 °C) and **back on at or above** (default
 4 °C, must be higher). The gap keeps a flickering outdoor reading from
-switching back and forth. The section shows whether quiet auto and tuning are
+switching back and forth. The *back on* temperature also ends quiet 0 after a
+defrost. The section shows whether quiet auto and tuning are
 currently cold-locked.

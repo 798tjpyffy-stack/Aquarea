@@ -548,6 +548,7 @@ class Tuner:
             q = entry.get("quiet") if isinstance(entry.get("quiet"), dict) else {}
             q_stored = dict(q.get("settings") or {})
             q_stored.pop("threshold", None)  # replaced by the shared outdoor settings (0.1.61)
+            q_stored.pop("defrost_until", None)  # replaced by the shared cold_release (0.1.65)
             try:
                 q_settings = quiet.validate_quiet({**quiet.DEFAULT_QUIET, **q_stored})
             except ValueError as ex:
