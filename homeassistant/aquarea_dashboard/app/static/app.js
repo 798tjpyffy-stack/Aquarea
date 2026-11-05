@@ -590,6 +590,7 @@ const HA_COLORS = ["#27ae60", "#c0392b", "#16a085", "#d35400", "#2c3e50", "#e843
 const COMPRESSOR_ON_KW = 0.2;
 const COMPRESSOR_OFF_KW = 0.08;
 const WATER_STEP_K = 1;
+const WATER_OFF_MIN = 15;
 const THERMO_OFF_K = 3;
 const THERMO_MS = 3 * 60_000;
 const TARGET_UPDATE_MS = 60 * 60_000;
@@ -815,7 +816,7 @@ function historyChart(rows) {
 
   return el("div", {}, legend, root, readout,
     el("p", { class: "muted", text: `${pts.length} data point(s) · stored in the history CSV${runtime}` }),
-    explain("compressor", `* Compressor estimated: OFF when operation is off, ON in defrost. Panasonic thermostat: OFF when Zone 1 water ≥ target + ${THERMO_OFF_K} K for ${THERMO_MS / 60_000} min (highest target of the last ${TARGET_UPDATE_MS / 60_000} min, since the unit's update time is unknown). Zone 1 water rising ${WATER_STEP_K} K above its low since the last change (e.g. the uptick after the pump-start dip) = ON, falling ${WATER_STEP_K} K below its high = OFF. Otherwise 15-min avg power ≥ ${COMPRESSOR_ON_KW * 1000} W = ON, ≤ ${COMPRESSOR_OFF_KW * 1000} W = OFF (ignored for ${POWER_LAG_MIN} min after a water-detected change, as the kWh total lags). Th.off: light = water within 1 K of target + ${THERMO_OFF_K} K (lowest possible target), dark = at/above it for the highest possible target (3-min timer running).`, "* Compressor estimate"));
+    explain("compressor", `* Compressor estimated: OFF when operation is off, ON in defrost. Panasonic thermostat: OFF when Zone 1 water ≥ target + ${THERMO_OFF_K} K for ${THERMO_MS / 60_000} min (highest target of the last ${TARGET_UPDATE_MS / 60_000} min, since the unit's update time is unknown). Zone 1 water rising ${WATER_STEP_K} K above its low since the last change (e.g. the uptick after the pump-start dip) = ON, falling ${WATER_STEP_K} K below its high and staying there ${WATER_OFF_MIN} min (or ${2 * WATER_STEP_K} K at once) = OFF, dated back to the first lower reading. Otherwise 15-min avg power ≥ ${COMPRESSOR_ON_KW * 1000} W = ON, ≤ ${COMPRESSOR_OFF_KW * 1000} W = OFF (ignored for ${POWER_LAG_MIN} min after a water-detected change, as the kWh total lags). Th.off: light = water within 1 K of target + ${THERMO_OFF_K} K (lowest possible target), dark = at/above it for the highest possible target (3-min timer running).`, "* Compressor estimate"));
 }
 
 // ------------------------------------------------------------------ outdoor thresholds

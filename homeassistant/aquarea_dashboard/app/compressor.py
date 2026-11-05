@@ -25,6 +25,12 @@ COMPRESSOR_ON_KW = 0.2
 COMPRESSOR_OFF_KW = 0.08
 WATER_STEP_K = 1
 MINUTE_MS = 60_000
+# Near a whole degree the reading flickers (e.g. 33/34 °C for hours while the
+# compressor runs at its limit in the cold), so a 1 K drop alone only counts as a
+# stop once no reading has been back at the high for this long (a 2 K drop at once;
+# usually the avg power shows a real stop earlier). The stop is dated back to the
+# first lower reading.
+WATER_OFF_MS = 15 * MINUTE_MS
 STARTUP_MS = 60 * MINUTE_MS
 THERMO_OFF_K = 3
 THERMO_MS = 3 * MINUTE_MS
@@ -125,7 +131,8 @@ def estimate(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
     Water readings are whole degrees and flicker, so a level only counts when two
     consecutive readings agree. ON: water rose WATER_STEP_K above its low since the
-    last change; OFF: water fell WATER_STEP_K below its high since the last change.
+    last change; OFF: water fell WATER_STEP_K below its high since the last change
+    and stayed there for WATER_OFF_MS (or fell 2 * WATER_STEP_K).
     """
     pts = [(t, r) for r in rows if (t := _ms(r)) is not None]
     pts.sort(key=lambda p: p[0])
@@ -142,6 +149,7 @@ def estimate(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     defrost_until: float | None = None
     recovering = False  # after a defrost until the water rises again
     water_off: int | None = None  # index where the water last showed a stop
+    below_at: int | None = None  # index since when the water is below its high
     j = 0
     for i, (t, p) in enumerate(pts):
         w = _num(p.get("zone1_water_temperature"))
@@ -159,6 +167,10 @@ def estimate(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         prev_op = op
         low = down if low is None else min(low, down)
         high = up if high is None else max(high, up)
+        if down > high - WATER_STEP_K:
+            below_at = None
+        elif below_at is None:
+            below_at = i
 
         # range of targets the unit may currently use
         while times[j] < t - TARGET_UPDATE_MS:
@@ -203,7 +215,7 @@ def estimate(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             nxt = "ON"
             why = "defrost" if defrost else f"after defrost (settling {DEFROST_SETTLE_MS // MINUTE_MS} min)"
             low, high = down, up  # water levels start fresh after the defrost
-            above_since, recovering = None, True
+            above_since, recovering, below_at = None, True, None
         elif state != "OFF" and thermo_off:
             nxt, by_trend = "OFF", True
             why = (
@@ -217,7 +229,12 @@ def estimate(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 if since_on is not None
                 else f"water up from {_n(low)} to {_n(up)} °C"
             )
-        elif state != "OFF" and not recovering and down <= high - WATER_STEP_K:
+        elif (
+            state != "OFF"
+            and not recovering
+            and below_at is not None
+            and (t - times[below_at] >= WATER_OFF_MS or down <= high - 2 * WATER_STEP_K)
+        ):
             nxt, why, by_trend = "OFF", f"water down from {_n(high)} to {_n(down)} °C", True
         elif pw_ok and pw.kw >= COMPRESSOR_ON_KW:
             nxt, why = "ON", f"avg power {pw.kw:.2f} kW"
@@ -246,10 +263,15 @@ def estimate(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             why += f" · near thermo off (target {t_range} °C + {THERMO_OFF_K} K)"
 
         if nxt != state:
+            stop_at = below_at if nxt == "OFF" and state == "ON" and op == "ON" else None
+            if stop_at is not None:  # the stop began with the first lower water reading
+                for _, r in pts[stop_at:i]:
+                    r.update(compressor="OFF", compressor_why=why, near_thermo_off=None)
             low, high = down, up
             if by_trend:
-                trend_at = t
-            water_off = i if nxt == "OFF" and why.startswith("water down") else None
+                trend_at = t if stop_at is None else times[stop_at]
+            water_off = stop_at if why.startswith("water down") else None
+            below_at = None
         state = nxt
         p["compressor"] = state
         p["compressor_why"] = why
