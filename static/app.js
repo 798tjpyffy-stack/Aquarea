@@ -606,6 +606,7 @@ const HA_COLORS = ["#27ae60", "#c0392b", "#16a085", "#d35400", "#2c3e50", "#e843
 const COMPRESSOR_ON_KW = 0.2;
 const COMPRESSOR_OFF_KW = 0.08;
 const WATER_STEP_K = 1;
+const WATER_OFF_MIN = 15;
 const THERMO_OFF_K = 3;
 const THERMO_MS = 3 * 60_000;
 const TARGET_UPDATE_MS = 60 * 60_000;
@@ -835,7 +836,7 @@ function historyChart(rows) {
 
   return el("div", {}, legend, root, readout,
     el("p", { class: "muted", text: `${pts.length} data point(s) · stored in the history CSV${runtime}` }),
-    explain("compressor", `Rows from HeishaMon: compressor ON when its frequency is above 0 Hz; power in/out as measured by the unit (held until the next row). Th.off: light = water outlet more than ${THERMO_OFF_K - 1} K above target, dark = more than ${THERMO_OFF_K} K (the unit's thermo off timer, about ${THERMO_MS / 60_000} min, runs). Older rows from the Panasonic cloud: compressor estimated (OFF when operation is off, ON in defrost; water rising/falling ${WATER_STEP_K} K; otherwise 15-min avg power ≥ ${COMPRESSOR_ON_KW * 1000} W = ON, ≤ ${COMPRESSOR_OFF_KW * 1000} W = OFF, ignored for ${POWER_LAG_MIN} min after a water-detected change; highest target of the last ${TARGET_UPDATE_MS / 60_000} min) and power from steps of today's kWh total.`, "Compressor and power"));
+    explain("compressor", `Rows from HeishaMon: compressor ON when its frequency is above 0 Hz; power in/out as measured by the unit (held until the next row). Th.off: light = water outlet more than ${THERMO_OFF_K - 1} K above target, dark = more than ${THERMO_OFF_K} K (the unit's thermo off timer, about ${THERMO_MS / 60_000} min, runs). Older rows from the Panasonic cloud: compressor estimated (OFF when operation is off, ON in defrost; water rising/falling ${WATER_STEP_K} K, falling only once held for ${WATER_OFF_MIN} min or ${2 * WATER_STEP_K} K; otherwise 15-min avg power ≥ ${COMPRESSOR_ON_KW * 1000} W = ON, ≤ ${COMPRESSOR_OFF_KW * 1000} W = OFF, ignored for ${POWER_LAG_MIN} min after a water-detected change; highest target of the last ${TARGET_UPDATE_MS / 60_000} min) and power from steps of today's kWh total.`, "Compressor and power"));
 }
 
 // ------------------------------------------------------------------ outdoor thresholds
