@@ -20,8 +20,8 @@ operation when it does not cost efficiency.
 
 | Branch | Version line | Data source | Status |
 | --- | --- | --- | --- |
-| `main` | 0.1.x (latest 0.1.65) | Panasonic Aquarea **cloud** via `aioaquarea` (polling) | deployed to HA, pushed |
-| `heishamon` | 0.2.x (latest 0.2.5) | **HeishaMon** over MQTT (local, live) | pushed, not yet deployed (owner deploys it on a weekend) |
+| `main` | 0.1.x (latest 0.1.66) | Panasonic Aquarea **cloud** via `aioaquarea` (polling) | deployed to HA, pushed |
+| `heishamon` | 0.2.x (latest 0.2.6) | **HeishaMon** over MQTT (local, live) | pushed, not yet deployed (owner deploys it on a weekend) |
 
 - `heishamon` branched from `16d0b43` (daily command limits) and replaced the
   cloud layer: `heishamon.py`, `thermo.py`, `energy.py` are new;
@@ -124,9 +124,11 @@ Switching from the local app to the repository app means a new slug: new
   the automatic function.
 - During a defrost and 10 min after it (`compressor.DEFROST_SETTLE_MS`,
   `Observation.hold_until`) no shift or power command is sent.
-- The night-time shutoff never cuts a run short: the unit is only turned off
-  after the compressor has been off for `night_off_early_wait_min`. Only a unit
-  the dashboard turned off is turned back on.
+- The night-time shutoff does not cut a run short: the unit is only turned off
+  after the compressor has been off for `night_off_early_wait_min`. Exception
+  (owner's request, 0.1.66/0.2.6): in the night hours (not before them, not in
+  an early off) a run that has reached `min_run_min` (> 0) may be cut when the
+  shutoff is due. Only a unit the dashboard turned off is turned back on.
 
 ## Features and reasoning
 

@@ -1014,7 +1014,8 @@ function buildTuningView(deviceId) {
       "outdoor temperature is back at or above the release temperature. A shift changed elsewhere pauses tuning. Night-time shutoff turns the whole unit (including " +
       "hot water) off for the night hours when the forecast mean of the following day is above the threshold and " +
       "the night minimum is not below its limit, and back on at the end of the night. It turns the unit off only " +
-      "when the compressor has been off for the wait time (a run is not cut short); when it is back on in the " +
+      "when the compressor has been off for the wait time (a run is not cut short, except in the night hours once " +
+      "it has reached the minimum run time); when it is back on in the " +
       "morning the shift goes back to normal. " +
       "Within the early shutoff time before the night this can already happen, avoiding a last short run. " +
       "With \u201cprevent unnecessary last run\u201d this can happen up to the set time before the night if the room, " +
