@@ -19,6 +19,7 @@ only detected from evidence (outlet rising again, or the average power).
 
 from __future__ import annotations
 
+import bisect
 import datetime as dt
 import math
 from dataclasses import dataclass
@@ -124,7 +125,10 @@ def estimate(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     Water readings are whole degrees and flicker, so a level only counts when two
     consecutive readings agree. ON: water rose WATER_STEP_K above its low since the
     last change; OFF: water fell WATER_STEP_K below its high since the last change
-    and stayed there for WATER_OFF_MS (or fell 2 * WATER_STEP_K).
+    and stayed there for WATER_OFF_MS (or fell 2 * WATER_STEP_K). A water-based OFF
+    is dropped when the first avg power clear of the kWh lag after it shows the
+    compressor running (the whole-degree readings mislead near the threshold; only
+    in hindsight, so a live false stop disappears ~30 min later).
     """
     pts = [(t, r) for r in rows if (t := _ms(r)) is not None]
     pts.sort(key=lambda p: p[0])
@@ -133,6 +137,16 @@ def estimate(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
     def power_at(t: float) -> PowerSegment | None:
         return next((s for s in power if s.start < t <= s.end), None)
+
+    seg_starts = [s.start for s in power]
+
+    def running_from(t0: float) -> PowerSegment | None:
+        """The first avg power starting at t0 (or up to 2 * POWER_LAG_MS later) if it
+        shows the compressor running (needs later rows: in hindsight only)."""
+        k = bisect.bisect_left(seg_starts, t0)
+        if k < len(power) and power[k].start <= t0 + 2 * POWER_LAG_MS and power[k].kw >= COMPRESSOR_ON_KW:
+            return power[k]
+        return None
 
     state: str | None = None
     low = high = prev_w = None
@@ -217,6 +231,11 @@ def estimate(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         hold = defrost or (defrost_until is not None and t < defrost_until)
         if recovering and not hold and up >= low + WATER_STEP_K:
             recovering = False
+        water_down = (
+            not recovering
+            and below_at is not None
+            and (t - times[below_at] >= WATER_OFF_MS or down <= high - 2 * WATER_STEP_K)
+        )
         if op == "OFF":
             nxt, why = "OFF", "operation off"
             recovering = False
@@ -232,6 +251,18 @@ def estimate(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             why = "defrost" if defrost else f"after defrost (settling {DEFROST_SETTLE_MS // MINUTE_MS} min)"
             low, high = down, up  # water levels start fresh after the defrost
             above_since, recovering, below_at = None, True, None
+        elif state != "OFF" and (water_down or thermo_off) and (
+            ran := running_from(
+                t + POWER_LAG_MS if thermo_off or below_at is None else max(times[below_at] + POWER_LAG_MS, t)
+            )
+        ):
+            # near the threshold the whole-degree readings mislead (the unit's own
+            # target has decimals): the avg power after it shows no stop
+            nxt = "ON"
+            seen = "water above thermo off threshold" if thermo_off else f"water down from {_n(high)} to {_n(down)} °C"
+            why = f"{seen}, but avg power {ran.kw:.2f} kW afterwards: still running"
+            if not thermo_off:
+                high, below_at = up, None
         elif state != "OFF" and thermo_off:
             nxt, by_trend = "OFF", True
             why = (
@@ -245,12 +276,7 @@ def estimate(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 if since_on is not None
                 else f"water up from {_n(low)} to {_n(up)} °C"
             )
-        elif (
-            state != "OFF"
-            and not recovering
-            and below_at is not None
-            and (t - times[below_at] >= WATER_OFF_MS or down <= high - 2 * WATER_STEP_K)
-        ):
+        elif state != "OFF" and water_down:
             nxt, why, by_trend = "OFF", f"water down from {_n(high)} to {_n(down)} °C", True
         elif pw_ok and pw.kw >= COMPRESSOR_ON_KW:
             nxt, why = "ON", f"avg power {pw.kw:.2f} kW"
