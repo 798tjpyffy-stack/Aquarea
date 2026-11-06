@@ -20,8 +20,8 @@ operation when it does not cost efficiency.
 
 | Branch | Version line | Data source | Status |
 | --- | --- | --- | --- |
-| `main` | 0.1.x (latest 0.1.66) | Panasonic Aquarea **cloud** via `aioaquarea` (polling) | deployed to HA, pushed |
-| `heishamon` | 0.2.x (latest 0.2.6) | **HeishaMon** over MQTT (local, live) | pushed, not yet deployed (owner deploys it on a weekend) |
+| `main` | 0.1.x (latest 0.1.67) | Panasonic Aquarea **cloud** via `aioaquarea` (polling) | deployed to HA, pushed |
+| `heishamon` | 0.2.x (latest 0.2.7) | **HeishaMon** over MQTT (local, live) | pushed, not yet deployed (owner deploys it on a weekend) |
 
 - `heishamon` branched from `16d0b43` (daily command limits) and replaced the
   cloud layer: `heishamon.py`, `thermo.py`, `energy.py` are new;
@@ -40,7 +40,7 @@ operation when it does not cost efficiency.
 
 | Topic | `main` (cloud) | `heishamon` |
 | --- | --- | --- |
-| Compressor on/off | estimated (`compressor.estimate`: water trend + 15-min avg power from `energy_today_kwh`) | measured: compressor frequency > 0 Hz (old cloud rows still estimated) |
+| Compressor on/off | estimated (`compressor.estimate`: water trend + 15-min avg power from `energy_today_kwh`; a water-based stop is dropped when the next clean avg power still shows ≥ 0.2 kW, 0.1.67/0.2.7) | measured: compressor frequency > 0 Hz (old cloud rows still estimated) |
 | +1 step timing | `up_wait_pct` (% of the last whole degree's heat-up time, `water_rise`), `MIN_STEP` 5 min, urgent at target + 3 K | follows the unit's **thermo off timer** live (`thermo.ThermoWatch`): step `step_lead_s` (60 s) before the 3-min timer runs out, once per timer |
 | Energy | cloud consumption (hourly kWh, lags ~15 min, local-day fix in 0.1.61) | integrated from HeishaMon power in/out (`energy.py`, `/data/energy.json`) |
 | Restart rule | unknown | learned (`thermo.py`, `/data/thermo.json`) |
