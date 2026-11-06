@@ -50,7 +50,9 @@ night_off_min_low; it is turned back on at the end of the night, or earlier if
 the night forecast drops below that minimum. Only a unit the dashboard turned
 off is turned back on; switching it on elsewhere ends the shutoff for that night.
 The unit is only turned off when the compressor has been off for
-night_off_early_wait_min (a run is never cut short, it may last into the night).
+night_off_early_wait_min (a run is not cut short, it may last into the night),
+except in the night hours once the run has lasted min_run_min (not with 0, not
+during an early off).
 When it reports on again after the dashboard turned it on, the shift (still
 lowered from the night) goes back to normal. Within
 night_off_early_min minutes before the night this can already happen, so the
@@ -1377,12 +1379,19 @@ class Tuner:
                     return None
                 prefix = f"{prefix} ({dyn_text})"
         wait_min = s["night_off_early_wait_min"]
-        # never cut a run short: off only once the compressor has been off for the wait time
-        if obs.compressor == "ON":
-            run = _run_minutes(obs)
+        run = _run_minutes(obs)
+        # never cut a run short (off only once the compressor has been off for the wait time),
+        # except in the night hours once the run has reached the min. run
+        cut = in_night and eo is None and s["min_run_min"] > 0 and run is not None and run >= s["min_run_min"]
+        if obs.compressor == "ON" and not cut:
+            min_run = (
+                f" or in the night hours after {s['min_run_min']} min of running"
+                if eo is None and s["min_run_min"]
+                else ""
+            )
             live["note"] = (
                 f"{prefix}: compressor running{f' for {run} min' if run is not None else ''}; "
-                f"shutoff {wait_min} min after it stops"
+                f"shutoff {wait_min} min after it stops{min_run}"
             )
             return None
         if obs.compressor is None and (eo or dyn_text):
@@ -1396,13 +1405,14 @@ class Tuner:
         if settle_until is not None and now < settle_until:
             live["note"] = f"{prefix}: compressor stopped at {stop:%H:%M}, shutoff at {settle_until:%H:%M}"
             return None
-        reason = f"night-time shutoff: {why}"
+        comp = f"compressor running {run} min ≥ min. run {s['min_run_min']} min" if cut else "compressor off"
+        reason = f"night-time shutoff ({comp}): {why}" if cut else f"night-time shutoff: {why}"
         if eo:
             reason = f"{why}, compressor off"
         elif dyn_text:
             reason = (
                 f"dynamic night-time shutoff (night until {window[1]:%H:%M}), {dyn_text}, "
-                f"compressor off: {why}"
+                f"{comp}: {why}"
             )
         elif trend_early:
             reason = (

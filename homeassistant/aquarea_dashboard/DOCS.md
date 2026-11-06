@@ -111,8 +111,11 @@ Only a unit the dashboard turned off is turned back on; turning it on elsewhere
 ends the shutoff for that night.
 
 The unit is only turned off once the compressor has been off for the **wait
-after compressor stop** (default 30 min): a run is never cut short and may last
-into the night (with the min. compressor run above). When the unit reports on
+after compressor stop** (default 30 min): a run is not cut short and may last
+into the night (with the min. compressor run above). In the night hours a run
+that has reached the min. compressor run is no longer protected: if the
+shutoff is due, the unit is turned off while the compressor runs (not with a
+min. run of 0, not during an early off). When the unit reports on
 again after the dashboard turned it on, the shift (still lowered from the
 night) is set back to normal. If the unit does not report off after 3 attempts, the
 dashboard gives up for that night, but still turns it back on at the end of the
