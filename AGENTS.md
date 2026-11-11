@@ -20,8 +20,8 @@ operation when it does not cost efficiency.
 
 | Branch | Version line | Data source | Status |
 | --- | --- | --- | --- |
-| `main` | 0.1.x (latest 0.1.67) | Panasonic Aquarea **cloud** via `aioaquarea` (polling) | deployed to HA, pushed |
-| `heishamon` | 0.2.x (latest 0.2.7) | **HeishaMon** over MQTT (local, live) | pushed, not yet deployed (owner deploys it on a weekend) |
+| `main` | 0.1.x (latest 0.1.68) | Panasonic Aquarea **cloud** via `aioaquarea` (polling) | deployed to HA, pushed |
+| `heishamon` | 0.2.x (latest 0.2.8) | **HeishaMon** over MQTT (local, live) | pushed, not yet deployed (owner deploys it on a weekend) |
 
 - `heishamon` branched from `16d0b43` (daily command limits) and replaced the
   cloud layer: `heishamon.py`, `thermo.py`, `energy.py` are new;
@@ -204,7 +204,9 @@ below `night_off_min_low`; back on at the end (or earlier if the forecast drops)
   soon as the projected room temperature at the end of the night (unit off)
   is ≥ gate temp + margin; not reached by `_until` → no shutoff that night.
 - **Stay off after the night** (`night_off_extend`): room still ≥ target at the
-  end → stays off until below; may chain into the next night.
+  end → stays off until below; may chain into the next night. Also at the end
+  of an early off (0.1.68/0.2.8; also with `night_off` disabled), not after
+  ending it manually (`early_off_cancelled`) or after the 6am gate.
 - **6am gate** (`night_off_gate`, time `06:00`, temp 21.0): from the first gate
   time after the start, indoor below the threshold ends the night / early off.
 - Switching the unit on elsewhere ends the shutoff for that night.

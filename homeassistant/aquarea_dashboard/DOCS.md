@@ -170,8 +170,9 @@ at or above the target until the next night, the unit stays off the whole day:
 within the early shutoff time before the next night, or with **prevent
 unnecessary last run** within its time if the projection to the night is still
 at or above the target, the next shutoff night takes over without turning the
-unit on in between (if its forecast conditions are met). Not after an early
-off, not after the 6am gate ended the night.
+unit on in between (if its forecast conditions are met). Also at the end of
+an early off (even with the night-time shutoff switched off), but not after
+ending it manually, and not after the 6am gate ended the night.
 
 **Dynamic night start** (checkbox, off by default; earliest 18:00, latest
 03:00, margin 0 K): an alternative to early shutoff and prevent unnecessary
@@ -208,7 +209,8 @@ and the night-time shutoff switch: the tuning runs in down mode (a running
 compressor still reaches the min. run, then keeps its shift until it stops on
 its own, then down), the unit is turned off once the compressor has
 been off for the wait time, and turned back on at the end (the shift goes back
-to normal). There is no max. pause reset during early off. If a shutoff night
+to normal; with **stay off after the night** only once the room is below the
+indoor target). There is no max. pause reset during early off. If a shutoff night
 overlaps, the unit stays off in between. **End early off** turns a unit it
 turned off back on at once (unless a shutoff night applies).
 
