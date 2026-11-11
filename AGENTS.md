@@ -20,7 +20,7 @@ operation when it does not cost efficiency.
 
 | Branch | Version line | Data source | Status |
 | --- | --- | --- | --- |
-| `main` | 0.1.x (latest 0.1.68) | Panasonic Aquarea **cloud** via `aioaquarea` (polling) | deployed to HA, pushed |
+| `main` | 0.1.x (latest 0.1.69) | Panasonic Aquarea **cloud** via `aioaquarea` (polling) | deployed to HA, pushed |
 | `heishamon` | 0.2.x (latest 0.2.8) | **HeishaMon** over MQTT (local, live) | pushed, not yet deployed (owner deploys it on a weekend) |
 
 - `heishamon` branched from `16d0b43` (daily command limits) and replaced the
@@ -118,7 +118,8 @@ Switching from the local app to the repository app means a new slug: new
 
 - The unit stores settings in **EEPROM**: at most 6 shift commands per hour
   and 48 per 24 h; quiet mode 10/h and 24/24 h. A skipped command is logged.
-- A command not confirmed by the unit is resent once after 20 s; unconfirmed
+- A command not confirmed by the unit is resent once (`main`: after 10 min,
+  cloud lag; `heishamon`: after 20 s); unconfirmed
   for 20 min → tuning pauses.
 - A shift or quiet level changed elsewhere (app, unit, manual control) pauses
   the automatic function.
