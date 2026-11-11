@@ -38,10 +38,11 @@ while a step was still possible (shift below normal + up_max) is logged.
 
 Safety: commands only with --allow-control, heating on and the zone in curve
 mode; at most one +1 step per MIN_STEP and only after the unit reports the
-previous value; at most MAX_COMMANDS_PER_HOUR commands per hour and
-MAX_COMMANDS_PER_DAY per 24 h (the unit likely stores settings in EEPROM,
-whose write endurance is unknown); a shift changed
-elsewhere (app, unit, this dashboard's manual control) pauses tuning. During a
+previous value; a command the unit has not taken over after RESEND_AFTER is sent
+once more (still not taken over CONFIRM_TIMEOUT later: tuning pauses); at most
+MAX_COMMANDS_PER_HOUR commands per hour and MAX_COMMANDS_PER_DAY per 24 h (the
+unit likely stores settings in EEPROM, whose write endurance is unknown); a
+shift changed elsewhere (app, unit, this dashboard's manual control) pauses tuning. During a
 defrost and compressor.DEFROST_SETTLE_MS after it (Observation.hold_until) no
 shift or power command is sent; compressor edges are acted on afterwards.
 
@@ -155,6 +156,8 @@ LOG_LIMIT = 200
 PUBLIC_LOG = 20
 MIN_STEP = dt.timedelta(minutes=5)
 CONFIRM_TIMEOUT = dt.timedelta(minutes=20)
+# unconfirmed command: send once more (the cloud status takes minutes to show a change)
+RESEND_AFTER = dt.timedelta(minutes=10)
 MAX_COMMANDS_PER_HOUR = 6
 MAX_COMMANDS_PER_DAY = 48
 POWER_RETRY = dt.timedelta(minutes=10)  # between power commands
@@ -415,6 +418,7 @@ class Command:
     reason: str
     step: bool = False  # +1 step near thermo off
     restore: bool = False  # back to normal after disabling
+    resend: bool = False  # the same value again, the unit has not taken it over
 
 
 def _iso(t: dt.datetime) -> str:
@@ -609,7 +613,10 @@ class Tuner:
             "settings": entry["settings"],
             "state": {
                 k: st.get(k)
-                for k in ("paused", "commanded", "confirmed", "compressor", "commanded_at", "water_degree_min", "cold_lock")
+                for k in (
+                    "paused", "commanded", "confirmed", "compressor", "commanded_at", "resent", "water_degree_min",
+                    "cold_lock",
+                )
             },
             "live": self._live.get(device_id, {}),
             "log": entry["log"][-PUBLIC_LOG:],
@@ -821,6 +828,7 @@ class Tuner:
         elif obs.shift == commanded:
             if not st.get("confirmed"):
                 st["confirmed"] = True
+                st.pop("resent", None)
                 self._log(entry, now, "confirmed", f"Unit reports shift {obs.shift}")
         elif st.get("confirmed") or obs.shift != st.get("previous"):
             self._pause(entry, now, f"shift changed outside tuning ({commanded} → {obs.shift})")
@@ -830,6 +838,13 @@ class Tuner:
             if sent is None or now - sent > CONFIRM_TIMEOUT:
                 self._pause(entry, now, f"unit still reports shift {obs.shift}, not {commanded}")
                 return None
+            if obs.control and not st.get("resent") and now - sent >= RESEND_AFTER:
+                live["mode"] = "resend"
+                live["note"] = f"unit still reports shift {obs.shift} after {int((now - sent).total_seconds() // 60)} min"
+                cmd = Command(
+                    commanded, obs.shift, f"{live['note']}: shift {commanded} sent again", resend=True
+                )
+                return None if self._limited(entry, live, now, cmd, live["note"]) else cmd
 
         if not obs.operation_on:
             live["mode"], live["note"] = "idle", "heating off"
@@ -980,6 +995,11 @@ class Tuner:
         cmd.value = max(lo, min(hi, cmd.value))
         if cmd.value == obs.shift or (cmd.value == commanded and not st.get("confirmed")):
             return None
+        return None if self._limited(entry, live, now, cmd, why) else cmd
+
+    def _limited(self, entry: dict[str, Any], live: dict[str, Any], now: dt.datetime, cmd: Command, why: str) -> bool:
+        """True (with a note and log entry) if the hourly or daily command limit is reached."""
+        st = entry["state"]
         recent = _sent_within(st, now, dt.timedelta(hours=1))
         daily = _sent_within(st, now, dt.timedelta(days=1))
         limit = None
@@ -992,8 +1012,8 @@ class Tuner:
             text = f"Limit {limit.split(',')[0]}: {cmd.reason}"
             if not entry["log"] or entry["log"][-1].get("text") != text:
                 self._log(entry, now, "skipped", text, to=cmd.value)
-            return None
-        return cmd
+            return True
+        return False
 
     def _night_down(self, entry: dict[str, Any], obs: Observation) -> bool:
         """Night hours with a shutoff planned or running ("down" mode); otherwise the room decides."""
@@ -1042,9 +1062,16 @@ class Tuner:
             self._log(entry, now, "error", f"Sending shift {cmd.value} failed: {error}", to=cmd.value)
         else:
             self._log(entry, now, "command", cmd.reason, **{"from": cmd.previous, "to": cmd.value})
-            if entry["settings"]["enabled"]:
+            if entry["settings"]["enabled"] and cmd.resend:
+                st.update(commanded_at=_iso(now), resent=True)  # keeps "previous" of the first send
+            elif entry["settings"]["enabled"]:
                 st.update(
-                    commanded=cmd.value, previous=cmd.previous, commanded_at=_iso(now), confirmed=False, sent=True
+                    commanded=cmd.value,
+                    previous=cmd.previous,
+                    commanded_at=_iso(now),
+                    confirmed=False,
+                    sent=True,
+                    resent=False,
                 )
                 if cmd.step:
                     st["last_step_at"] = _iso(now)

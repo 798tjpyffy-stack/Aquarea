@@ -1012,7 +1012,7 @@ function buildTuningView(deviceId) {
       "until it has run). " +
       "When a +1 step is due with the outdoor temperature at or below the cold threshold (Outdoor thresholds), " +
       "tuning goes off instead: the shift goes back to normal and stays there (no up or down steps) until the " +
-      "outdoor temperature is back at or above the release temperature. A shift changed elsewhere pauses tuning. Night-time shutoff turns the whole unit (including " +
+      "outdoor temperature is back at or above the release temperature. A shift changed elsewhere pauses tuning; so does a shift the unit has not taken over 20 min after it was sent again (resent once after 10 min). Night-time shutoff turns the whole unit (including " +
       "hot water) off for the night hours when the forecast mean of the following day is above the threshold and " +
       "the night minimum is not below its limit, and back on at the end of the night. It turns the unit off only " +
       "when the compressor has been off for the wait time (a run is not cut short, except in the night hours once " +

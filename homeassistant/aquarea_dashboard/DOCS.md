@@ -81,8 +81,10 @@ section changes the curve shift automatically to lengthen compressor runs:
   running throughout, so a defrost is no extra start, and the lower water
   temperature after it is not taken as a stop until the water has risen again.
 
-At most one step per 5 minutes and 6 commands per hour. A shift changed elsewhere
-(Panasonic app, unit, manual control) pauses tuning. The indoor sensor must be
+At most one step per 5 minutes and 6 commands per hour. A shift the unit has not
+taken over after 10 minutes is sent once more; still not taken over 20 minutes
+later, tuning pauses (enable it again in the Tuning tile). A shift changed
+elsewhere (Panasonic app, unit, manual control) pauses tuning. The indoor sensor must be
 one of the `ha_sensors` (or leave `ha_sensors` empty). Settings, state and log are
 stored in the app's private `/data/tuning.json`.
 
