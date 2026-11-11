@@ -71,7 +71,9 @@ it is below the target (then on). Projected with the learned cooling model, a ro
 that stays warm until the next night stays off the whole day: within the early
 shutoff time, or (with night_off_trend) within night_off_trend_min if the
 projection to the next night is still at or above the target, the next shutoff
-night takes over without turning the unit on in between.
+night takes over without turning the unit on in between. The same applies at
+the end of an early off (not when it was ended manually or by the 6am gate),
+also without the night-time shutoff switch.
 Dynamic start (night_off_dynamic, alternative to night_off_early_min / night_off_trend,
 which are then ignored): between night_off_dynamic_from and night_off_dynamic_until
 the unit is turned off once the cooling model projects the room (unit off) to be at
@@ -90,7 +92,8 @@ same applies as during a shutoff night, without the forecast conditions and
 the night_off switch: "down" mode (runs still reach min_run_min), shutoff once
 the compressor has been off for night_off_early_wait_min, on again at the end.
 No max. pause reset during early off. An overlapping shutoff night continues
-without turning the unit on in between.
+without turning the unit on in between; with night_off_extend a room still at
+or above the indoor target at its end keeps the unit off until it is below.
 
 Auto early off (early_off_auto): when the indoor temperature rises above
 early_off_auto_temp while the unit is on, an early off starts that lasts until
@@ -501,8 +504,8 @@ def _projection(obs: Observation, at: dt.datetime, target: float | None = None) 
     return projected, text, below_at
 
 
-def _extend_note(obs: Observation, target: float, next_night: dt.datetime | None) -> str:
-    base = f"unit off after the night: indoor {_n(obs.indoor)} °C ≥ target {_n(target)} °C"
+def _extend_note(obs: Observation, target: float, next_night: dt.datetime | None, after: str = "the night") -> str:
+    base = f"unit off after {after}: indoor {_n(obs.indoor)} °C ≥ target {_n(target)} °C"
     proj = _projection(obs, next_night, target) if next_night is not None else None
     if proj is None:
         return f"{base}; on when below the target (no cooling model)"
@@ -643,6 +646,9 @@ class Tuner:
         entry = self.entry(device_id)
         if entry["state"].pop("early_off", None) is not None:
             entry["state"]["early_off_auto_blocked"] = True  # no auto restart until the room has cooled
+            no = entry["state"].get("night_off") or {}
+            if no.get("active") and str(no.get("night")).startswith("early off"):
+                no["early_off_cancelled"] = True  # turn on, do not stay off after it
             self._log(entry, now, "early off", "Early off ended manually")
             self.save()
 
@@ -1200,29 +1206,31 @@ class Tuner:
         if no.get("active"):
             extend_note = None
             if not (in_night or early) or no.get("night") != key:
-                end_reason = "early off over" if str(no.get("night")).startswith("early off") else "night over"
+                after_early_off = str(no.get("night")).startswith("early off")
+                end_reason = "early off over" if after_early_off else "night over"
+                after = "the early off" if after_early_off else "the night"
                 if (
-                    end_reason == "night over"
-                    and s["night_off_extend"]
-                    and enabled
+                    s["night_off_extend"]
+                    # an early off works without the night-time shutoff switch; not when ended manually
+                    and (not no.get("early_off_cancelled") if after_early_off else enabled)
                     and not no.get("gate")
                     and not obs.unit_on
                 ):
                     target = s["indoor_target"]
                     if obs.indoor is not None and obs.indoor >= target:
                         end_reason = None
-                        extend_note = _extend_note(obs, target, window[0] if window else None)
+                        extend_note = _extend_note(obs, target, window[0] if window else None, after)
                         if not no.get("extended"):
                             no["extended"] = True
                             self._log(
                                 entry, now, "power",
-                                f"Unit stays off after the night: indoor {_n(obs.indoor)} °C ≥ target {_n(target)} °C",
+                                f"Unit stays off after {after}: indoor {_n(obs.indoor)} °C ≥ target {_n(target)} °C",
                             )
                     elif no.get("extended"):
                         end_reason = (
-                            "no indoor reading after the night"
+                            f"no indoor reading after {after}"
                             if obs.indoor is None
-                            else f"indoor {_n(obs.indoor)} °C < target {_n(target)} °C after the night"
+                            else f"indoor {_n(obs.indoor)} °C < target {_n(target)} °C after {after}"
                         )
             elif not enabled:
                 end_reason = "night-time shutoff disabled"

@@ -260,7 +260,8 @@ function buildEarlyOffView(deviceId) {
     if (forHours.checked && !(h >= 0.5 && h <= 48)) return showAppError("Hours must be between 0.5 and 48.");
     const until = forHours.checked ? `for ${h} h` : morningText.textContent.toLowerCase();
     if (!confirm(`Start early off ${until}? The unit (including hot water) is turned off once the compressor ` +
-      "has stopped and stayed off for the shutoff wait time, and turned back on at the end.")) return;
+      "has stopped and stayed off for the shutoff wait time, and turned back on at the end (with \u201cstay off " +
+      "after the night\u201d once the room is below the indoor target).")) return;
     send(forHours.checked ? { action: "hours", hours: h } : { action: "morning" }, start);
   });
   stop.addEventListener("click", () => {
@@ -982,7 +983,7 @@ function buildTuningView(deviceId) {
     field("Dynamic start: latest", f.night_off_dynamic_until, "at or after “night from”; not reached = no shutoff that night"),
     field("Dynamic start: margin K", f.night_off_dynamic_margin,
       "off once the room is projected at or above the 6am gate temperature + margin at the end of the night"),
-    el("label", { class: "check" }, f.night_off_extend, el("span", { text: "Stay off after the night while the room is at or above the target" })),
+    el("label", { class: "check" }, f.night_off_extend, el("span", { text: "Stay off after the night or early off while the room is at or above the target" })),
     el("label", { class: "check" }, f.night_off_gate, el("span", { text: "6am gate: end the shutoff night or early off if the room is too cold" })),
     field("6am gate: from", f.night_off_gate_time, "must lie within the night (or early off)"),
     field("6am gate: on again below indoor °C", f.night_off_gate_temp, "unit is turned on and stays on for the rest of the night"),
@@ -1024,7 +1025,8 @@ function buildTuningView(deviceId) {
       "following hours; fitted daily from 2 h samples from 17:00 to 08:00, starting 30 min after a compressor " +
       "stop), is still at or above the indoor target at the start of the night " +
       "(only while the compressor is off). " +
-      "With \u201cstay off after the night\u201d the unit stays off at the end of a shutoff night until the room is " +
+      "With \u201cstay off after the night\u201d the unit stays off at the end of a shutoff night or early off (not " +
+      "one ended manually) until the room is " +
       "below the indoor target; if the cooling model shows it stays warm until the next night, the next " +
       "shutoff takes over within the early shutoff time (or, with \u201cprevent unnecessary last run\u201d, within its " +
       "time if the projection is still at or above the target), so the unit stays off the whole day. " +
