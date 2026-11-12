@@ -84,6 +84,11 @@ section changes the curve shift automatically to lengthen compressor runs:
   tuning goes off instead, the shift returns to normal and stays there (no up
   or down steps) until the outdoor temperature is back at or above the release
   temperature.
+- **Shift range** (see *Outdoor thresholds*): *max. shift up* and *shift down*
+  apply in full only at or above the *full shift range* temperature (default
+  8 °C); at or above the *±2* temperature (default 5 °C) at most ±2, below it ±1. The
+  outdoor temperature when a +1 step or a shift down is due counts; a shift
+  already beyond the range is kept.
 - During a defrost and for 10 minutes after it, tuning and the night-time
   shutoff take no action (quiet mode auto still does). The compressor counts as
   running throughout, so a defrost is no extra start, and the lower water
@@ -254,3 +259,7 @@ Shared by quiet mode auto and the tuning (section "Outdoor thresholds"):
 switching back and forth. The *back on* temperature also ends quiet 0 after a
 defrost. The section shows whether quiet auto and tuning are
 currently cold-locked.
+
+It also limits the tuning's shift range: **full shift range from** (default
+8 °C) allows *max. shift up* / *shift down* as set, **±2 from** (default 5 °C,
+must be lower) at most ±2; below that at most ±1.

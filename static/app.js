@@ -857,6 +857,8 @@ function buildOutdoorView(deviceId) {
   const f = {
     cold_threshold: el("input", { type: "number", min: "-20", max: "20", step: "0.5" }),
     cold_release: el("input", { type: "number", min: "-20", max: "20", step: "0.5" }),
+    full_range_from: el("input", { type: "number", min: "-20", max: "25", step: "0.5" }),
+    range_2_from: el("input", { type: "number", min: "-20", max: "25", step: "0.5" }),
   };
   const field = (label, input, hint) =>
     el("label", {}, el("span", { text: label }), input, el("small", { class: "muted", text: hint }));
@@ -865,7 +867,9 @@ function buildOutdoorView(deviceId) {
   const details = section("Outdoor thresholds (quiet auto + tuning)", el("div", {},
     el("div", { class: "tuning-form" },
       field("Cold at or below °C", f.cold_threshold, "quiet auto: 0; tuning: off at the next +1 step"),
-      field("Back on at or above °C", f.cold_release, "ends the cold lock of both and the quiet 0 after a defrost")),
+      field("Back on at or above °C", f.cold_release, "ends the cold lock of both and the quiet 0 after a defrost"),
+      field("Full shift range from °C", f.full_range_from, "tuning: max. shift up / shift down as set"),
+      field("Shift \u00b12 from °C", f.range_2_from, "tuning: at most \u00b12; below \u00b11")),
     allowControl ? el("div", { class: "control-row" }, save) : null,
     status));
   let dirty = false;
@@ -886,7 +890,7 @@ function buildOutdoorView(deviceId) {
   }
 
   save.addEventListener("click", async () => {
-    const body = { cold_threshold: Number(f.cold_threshold.value), cold_release: Number(f.cold_release.value) };
+    const body = Object.fromEntries(Object.entries(f).map(([k, input]) => [k, Number(input.value)]));
     save.disabled = true;
     save.textContent = "Saving…";
     try {
@@ -1032,7 +1036,9 @@ function buildTuningView(deviceId) {
       "until it has run). " +
       "When a +1 step is due with the outdoor temperature at or below the cold threshold (Outdoor thresholds), " +
       "tuning goes off instead: the shift goes back to normal and stays there (no up or down steps) until the " +
-      "outdoor temperature is back at or above the release temperature. A shift changed elsewhere pauses tuning. Night-time shutoff turns the whole unit (including " +
+      "outdoor temperature is back at or above the release temperature. The outdoor thresholds also limit the range: " +
+      "max. shift up / shift down as set only at or above the full range temperature, at most \u00b12 at or above the \u00b12 " +
+      "temperature, else \u00b11 (outdoor temperature when a step or shift down is due; a shift already beyond the range is kept). A shift changed elsewhere pauses tuning. Night-time shutoff turns the whole unit (including " +
       "hot water) off for the night hours when the forecast mean of the following day is above the threshold and " +
       "the night minimum is not below its limit, and back on at the end of the night. It turns the unit off only " +
       "when the compressor has been off for the wait time (a run is not cut short, except in the night hours once " +

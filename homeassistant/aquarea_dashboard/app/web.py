@@ -573,7 +573,7 @@ async def api_quiet_auto(request: web.Request) -> web.Response:
 
 
 async def api_outdoor(request: web.Request) -> web.Response:
-    """Save the shared outdoor settings (cold threshold / release)."""
+    """Save the shared outdoor settings (cold threshold / release, shift range)."""
     body, error = await _control_body(request)
     if error:
         return error

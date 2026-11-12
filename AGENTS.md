@@ -20,8 +20,8 @@ operation when it does not cost efficiency.
 
 | Branch | Version line | Data source | Status |
 | --- | --- | --- | --- |
-| `main` | 0.1.x (latest 0.1.70) | Panasonic Aquarea **cloud** via `aioaquarea` (polling) | deployed to HA, pushed |
-| `heishamon` | 0.2.x (latest 0.2.9) | **HeishaMon** over MQTT (local, live) | pushed, not yet deployed (owner deploys it on a weekend) |
+| `main` | 0.1.x (latest 0.1.71) | Panasonic Aquarea **cloud** via `aioaquarea` (polling) | deployed to HA, pushed |
+| `heishamon` | 0.2.x (latest 0.2.10) | **HeishaMon** over MQTT (local, live) | pushed, not yet deployed (owner deploys it on a weekend) |
 
 - `heishamon` branched from `16d0b43` (daily command limits) and replaced the
   cloud layer: `heishamon.py`, `thermo.py`, `energy.py` are new;
@@ -193,6 +193,12 @@ Tuning checks the outdoor temperature only when a +1 step is due; at or below
 the threshold it goes "off" (cold lock) until ≥ release. Quiet auto: quiet 0
 while cold-locked. (Replaced `settings.min_outdoor` and the quiet threshold;
 old keys are dropped on load.)
+
+Shift range (0.1.71/0.2.10, `shift_range`): `full_range_from` (8 °C) /
+`range_2_from` (5 °C) in `entry["outdoor"]`: full `up_max`/`down_max` only
+at or above 8 °C, at most ±2 at or above 5 °C, else ±1. Checked when a +1 step or a shift
+down is decided; a shift already beyond the range is kept (avoids
+extra EEPROM writes on a flickering reading). Missing keys get defaults on load.
 
 ### Night-time shutoff
 
