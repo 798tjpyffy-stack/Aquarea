@@ -997,14 +997,15 @@ function buildTuningView(deviceId) {
     explain("tuning",
       "Lengthens compressor runs: while it runs and the room needs heat, the shift goes up by 1 when the water is " +
       "within 1 K of the thermo off point (target + 3 K), up to normal + max. When the compressor stops, the shift " +
-      "goes back to normal, or down by \u201cshift down\u201d in the night hours while a shutoff is planned or running " +
-      "(otherwise the room decides, e.g. after the 6am gate) or when the room is warmer than the indoor target " +
+      "goes back to normal, or down by \u201cshift down\u201d in the night hours of a night without shutoff because the " +
+      "forecast conditions are not met (otherwise the room decides, also in a shutoff night) or when the room is " +
+      "warmer than the indoor target " +
       "(also later while it is off, as soon as that applies); " +
       "when it starts again (or runs with the shift below normal), back to normal. Until a run reaches the minimum run time the shift also goes up in " +
       "down mode (never above normal + max); after that the shift is kept until the compressor stops on its own " +
       "(with the room warmer than the indoor target at most 1 h after the last shift, then back to normal). " +
       "From the start of the night until the 6am gate time a room that needs heat gets the up steps only until the " +
-      "minimum run time (night mode); a warm room or a shutoff night shifts down as always. " +
+      "minimum run time (night mode); a warm room or a night without shutoff by the forecast shifts down as always. " +
       "A +1 step waits the set share of the time the water took to heat up its last degree, counted from reaching " +
       "the current degree (avoids spikes in the unit's power calculation). " +
       "If the compressor stays off longer than the maximum pause with the shift lowered and the room is not " +

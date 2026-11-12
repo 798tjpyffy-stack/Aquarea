@@ -39,11 +39,11 @@ section changes the curve shift automatically to lengthen compressor runs:
   the shift goes up by 1 when the water is within 1 K of the thermo off point
   (target + 3 K), up to *normal + max. shift up*.
 - When the compressor stops, the shift returns to normal, or to *normal − shift
-  down* in the night hours while a night-time shutoff is planned or running, or
-  when the indoor sensor is above the indoor target. In the night hours without
-  a shutoff (switch off, forecast conditions not met, unit on again after the
-  6am gate or turned on elsewhere, dynamic start not reached) the indoor
-  temperature decides as by day. While
+  down* in the night hours of a night without shutoff because the forecast
+  conditions are not met (night-time shutoff switch on), or when the indoor
+  sensor is above the indoor target. In other night hours (shutoff planned or
+  running, switch off, no forecast) the indoor temperature decides as by day.
+  While
   the compressor is off this also happens later, as soon as the night starts
   or the room gets warmer than the target.
 - When the compressor starts again, the shift returns to normal (also later
@@ -58,7 +58,8 @@ section changes the curve shift automatically to lengthen compressor runs:
 - **Night hours**: from the start of the night (*Night from*) until the *6am
   gate* time, a room that needs heat still gets the +1 steps only until the run
   reaches the min. run (mode *night*), whether or not the night-time shutoff is
-  on. A warm room or a shutoff night shifts down as always.
+  on. A warm room or a night without shutoff by the forecast shifts down as
+  always.
 - **Up step wait** (default 85 %, 0 = at once): a +1 step waits this share of
   the time the water took for its last whole degree, counted from when it
   reached its current degree. A late step keeps the unit's own regulation from
