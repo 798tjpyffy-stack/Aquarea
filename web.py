@@ -810,7 +810,7 @@ async def api_quiet_auto(request: web.Request) -> web.Response:
 
 
 async def api_outdoor(request: web.Request) -> web.Response:
-    """Save the shared outdoor settings (cold threshold / release) for a device."""
+    """Save the shared outdoor settings (cold threshold / release, shift range) for a device."""
     if not request.app[ALLOW_CONTROL]:
         return web.json_response(
             {"error": "Control is disabled. Start the server with --allow-control."}, status=403

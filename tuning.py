@@ -26,7 +26,10 @@ goes back to normal so that it restarts on its own (no shift down again until
 the compressor has run). Cold (shared outdoor settings, DEFAULT_OUTDOOR): the
 outdoor temperature only matters when a +1 step is due; at or below cold_threshold
 tuning goes off instead (cold lock: shift back to normal, no up or down steps) until
-the outdoor temperature is back at or above cold_release.
+the outdoor temperature is back at or above cold_release. The outdoor settings also
+limit up_max / down_max (shift_range): in full only at or above full_range_from,
+at most 2 at or above range_2_from, else 1 (outdoor reading when a step or shift down is due; a
+shift already beyond the range is kept).
 A +1 step waits up_wait_pct % of the time the last whole water degree took to
 heat up (timed in the current run, else the last timed degree), counted from
 when the water reached its current degree (avoids spikes in the unit's own
@@ -150,8 +153,14 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "early_off_auto": True,  # early off while the room is warmer than early_off_auto_temp
     "early_off_auto_temp": 23.0,  # °C; lasts until the room is below indoor_target
 }
-# shared by quiet auto and tuning: cold at or below cold_threshold, back at or above cold_release
-DEFAULT_OUTDOOR: dict[str, Any] = {"cold_threshold": 2.0, "cold_release": 4.0}
+# shared by quiet auto and tuning: cold at or below cold_threshold, back at or above cold_release;
+# tuning: full up_max / down_max only at or above full_range_from, at most ±2 at or above range_2_from, else ±1
+DEFAULT_OUTDOOR: dict[str, Any] = {
+    "cold_threshold": 2.0,
+    "cold_release": 4.0,
+    "full_range_from": 8.0,
+    "range_2_from": 5.0,
+}
 LOG_LIMIT = 200
 PUBLIC_LOG = 20
 MIN_STEP = dt.timedelta(minutes=5)
@@ -269,7 +278,24 @@ def validate_outdoor(body: Any) -> dict[str, Any]:
     rel = _float(body["cold_release"], "cold_release", -20, 20)
     if rel <= thr:
         raise ValueError("cold_release must be above cold_threshold.")
-    return {"cold_threshold": thr, "cold_release": rel}
+    full = _float(body["full_range_from"], "full_range_from", -20, 25)
+    two = _float(body["range_2_from"], "range_2_from", -20, 25)
+    if full <= two:
+        raise ValueError("full_range_from must be above range_2_from.")
+    return {"cold_threshold": thr, "cold_release": rel, "full_range_from": full, "range_2_from": two}
+
+
+def shift_range(
+    settings: dict[str, Any], outdoor_settings: dict[str, Any], outdoor: float | None
+) -> tuple[int, int, str | None]:
+    """Max. shift up / down for the outdoor temperature, with a note when the outdoor thresholds limit it."""
+    up, down = settings["up_max"], settings["down_max"]
+    if outdoor is None or outdoor >= outdoor_settings["full_range_from"]:
+        return up, down, None
+    cap = 2 if outdoor >= outdoor_settings["range_2_from"] else 1
+    if up <= cap and down <= cap:
+        return up, down, None
+    return min(up, cap), min(down, cap), f"outdoor {_n(outdoor)} °C: shift ±{cap} max."
 
 
 def _minutes(hhmm: str) -> int:
@@ -565,7 +591,7 @@ class Tuner:
                 q_settings = dict(quiet.DEFAULT_QUIET)
             q_state = q.get("state") if isinstance(q.get("state"), dict) else {}
             try:
-                outdoor = validate_outdoor(entry.get("outdoor") or dict(DEFAULT_OUTDOOR))
+                outdoor = validate_outdoor({**DEFAULT_OUTDOOR, **(entry.get("outdoor") or {})})
             except ValueError as ex:
                 _LOGGER.error("Invalid outdoor settings for %s, using defaults: %s", device_id, ex)
                 outdoor = dict(DEFAULT_OUTDOOR)
@@ -856,6 +882,10 @@ class Tuner:
             return None
 
         normal, lo, hi = s["normal_shift"], *obs.limits
+        up_max, down_max, range_note = shift_range(s, o, obs.outdoor)
+        if range_note and mode != "off":
+            why = f"{why} · {range_note}"
+            live["note"] = why
         if st.get("reset_after_on") and obs.shift == normal:
             st.pop("reset_after_on")
         run_min = _run_minutes(obs)
@@ -873,7 +903,7 @@ class Tuner:
         # could a +1 step still be made? (checked at the next stop: stopped before max. shift)
         step_possible = st.pop("step_possible", False) if obs.compressor != "ON" else False
         if obs.compressor == "ON":
-            st["step_possible"] = (mode == "up" or short) and obs.shift < normal + s["up_max"]
+            st["step_possible"] = (mode == "up" or short) and obs.shift < normal + up_max
         cmd: Command | None = None
         if mode == "off":
             if obs.shift != normal:
@@ -881,18 +911,18 @@ class Tuner:
         elif st.get("reset_after_on"):
             cmd = Command(normal, obs.shift, "unit turned on after the shutoff: back to normal shift")
         elif prev == "ON" and obs.compressor == "OFF":
-            if step_possible and obs.shift < normal + s["up_max"]:
+            if step_possible and obs.shift < normal + up_max:
                 self._log(
                     entry,
                     now,
                     "early stop",
-                    f"Compressor stopped at shift {obs.shift} before max. {normal + s['up_max']} "
+                    f"Compressor stopped at shift {obs.shift} before max. {normal + up_max} "
                     f"(water {_n(obs.water)} °C, target {_n(obs.target)} °C)",
                     shift=obs.shift,
                     water=obs.water,
                     target=obs.target,
                 )
-            value = normal - s["down_max"] if mode == "down" else normal
+            value = normal - down_max if mode == "down" else normal
             cmd = Command(value, obs.shift, f"compressor stopped ({why})")
         elif prev == "OFF" and obs.compressor == "ON":
             cmd = Command(normal, obs.shift, "compressor started")
@@ -918,10 +948,10 @@ class Tuner:
         elif (
             obs.compressor == "OFF"
             and mode == "down"
-            and obs.shift > normal - s["down_max"]
+            and obs.shift > normal - down_max
             and not pause_reset
         ):
-            cmd = Command(normal - s["down_max"], obs.shift, f"compressor off, {why}: shift down")
+            cmd = Command(normal - down_max, obs.shift, f"compressor off, {why}: shift down")
         elif obs.compressor == "ON" and mode != "up" and not short and obs.shift > normal:
             # keep the raised shift: the compressor stops on its own, then back to normal / down;
             # with a warm room only up to RAISED_KEEP_MAX after the last shift command
@@ -947,7 +977,7 @@ class Tuner:
             and obs.water is not None
             and obs.target is not None
             and obs.water >= obs.target + NEAR_K
-            and obs.shift < normal + s["up_max"]
+            and obs.shift < normal + up_max
         ):
             last_step = _parse(st.get("last_step_at"))
             degree_min = obs.water_degree_min if obs.water_degree_min is not None else st.get("water_degree_min")
@@ -985,7 +1015,7 @@ class Tuner:
                 if mode != "up":
                     reason += f" (run {run_min} of min. {s['min_run_min']} min; {why})"
                 cmd = Command(
-                    min(max(obs.shift + 1, normal), normal + s["up_max"]),
+                    min(max(obs.shift + 1, normal), normal + up_max),
                     obs.shift,
                     reason,
                     step=True,
