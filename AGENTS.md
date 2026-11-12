@@ -20,8 +20,8 @@ operation when it does not cost efficiency.
 
 | Branch | Version line | Data source | Status |
 | --- | --- | --- | --- |
-| `main` | 0.1.x (latest 0.1.69) | Panasonic Aquarea **cloud** via `aioaquarea` (polling) | deployed to HA, pushed |
-| `heishamon` | 0.2.x (latest 0.2.8) | **HeishaMon** over MQTT (local, live) | pushed, not yet deployed (owner deploys it on a weekend) |
+| `main` | 0.1.x (latest 0.1.70) | Panasonic Aquarea **cloud** via `aioaquarea` (polling) | deployed to HA, pushed |
+| `heishamon` | 0.2.x (latest 0.2.9) | **HeishaMon** over MQTT (local, live) | pushed, not yet deployed (owner deploys it on a weekend) |
 
 - `heishamon` branched from `16d0b43` (daily command limits) and replaced the
   cloud layer: `heishamon.py`, `thermo.py`, `energy.py` are new;
@@ -152,8 +152,9 @@ Switching from the local app to the repository app means a new slug: new
 Goal: longer runs, fewer starts. Modes from `Tuner._mode`:
 
 - **off** – cold lock (see outdoor thresholds): normal shift, no up/down.
-- **down** – early off, shutoff night (`_night_down`), or room warmer than the
-  indoor target.
+- **down** – early off, night hours of a night without shutoff because the
+  forecast thresholds are not met (`_night_down`, `night_off` on; 0.1.70/0.2.9,
+  before: shutoff nights), or room warmer than the indoor target.
 - **hold** – indoor temperature unavailable.
 - **night** (0.1.62/0.2.2) – room needs heat, between `night_start` and the
   first `night_off_gate_time` after it (independent of the shutoff switches):
@@ -211,8 +212,8 @@ below `night_off_min_low`; back on at the end (or earlier if the forecast drops)
 - **6am gate** (`night_off_gate`, time `06:00`, temp 21.0): from the first gate
   time after the start, indoor below the threshold ends the night / early off.
 - Switching the unit on elsewhere ends the shutoff for that night.
-- In night hours without a shutoff the room decides as by day (except the
-  0.1.62 night mode limit above).
+- In a shutoff night the room decides as by day (except the 0.1.62 night mode
+  limit above); a night without shutoff because of the forecast is "down".
 
 ### Early off
 

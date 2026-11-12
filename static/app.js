@@ -1018,14 +1018,15 @@ function buildTuningView(deviceId) {
       "unit would stop: HeishaMon shows when the water outlet goes above target + 3 K, which starts the unit's " +
       "3-minute thermo off timer; the step is sent the set lead time before it runs out (once per timer; resent once " +
       "if the unit does not confirm it), up to normal + max. When the compressor stops, the shift " +
-      "goes back to normal, or down by \u201cshift down\u201d in the night hours while a shutoff is planned or running " +
-      "(otherwise the room decides, e.g. after the 6am gate) or when the room is warmer than the indoor target " +
+      "goes back to normal, or down by \u201cshift down\u201d in the night hours of a night without shutoff because the " +
+      "forecast conditions are not met (otherwise the room decides, also in a shutoff night) or when the room is " +
+      "warmer than the indoor target " +
       "(also later while it is off, as soon as that applies); " +
       "when it starts again (or runs with the shift below normal), back to normal. Until a run reaches the minimum run time the shift also goes up in " +
       "down mode (never above normal + max); after that the shift is kept until the compressor stops on its own " +
       "(with the room warmer than the indoor target at most 1 h after the last shift, then back to normal). " +
       "From the start of the night until the 6am gate time a room that needs heat gets the up steps only until the " +
-      "minimum run time (night mode); a warm room or a shutoff night shifts down as always. " +
+      "minimum run time (night mode); a warm room or a night without shutoff by the forecast shifts down as always. " +
       "If the compressor stays off longer than the maximum pause with the shift lowered and the room is not " +
       "warmer than the indoor target, the shift goes back to normal so it restarts on its own (no shift down again " +
       "until it has run). " +

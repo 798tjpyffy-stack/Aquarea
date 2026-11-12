@@ -5,10 +5,10 @@ Panasonic stops the compressor when the water outlet stays > target + 3 K for
 needs heat ("up" mode), the shift is raised by 1 whenever the water gets within
 1 K of that threshold, up to normal + up_max. When the compressor stops the
 shift goes back to normal, or to normal − down_max in "down" mode (night hours
-with a shutoff planned or running, or room warmer than the indoor target), which
-lowers the target for the next run. In the night hours without a shutoff (night_off
-off, forecast conditions not met, unit on again after the gate / turned on elsewhere,
-dynamic start not reached) the indoor temperature decides as by day.
+of a night without shutoff because the forecast conditions are not met, with
+night_off on; or room warmer than the indoor target), which lowers the target
+for the next run. In other night hours (shutoff planned or running, night_off off,
+no forecast) the indoor temperature decides as by day.
 While the compressor is off, a change to "down" mode (e.g. the room gets warmer
 than the target after the stop) also lowers the shift to normal − down_max.
 When the compressor starts again the shift returns to normal (also later while
@@ -19,8 +19,8 @@ own (only the cold lock resets it at once; with the room warmer than the indoor
 target it goes back to normal if the compressor still runs RAISED_KEEP_MAX after
 the last shift command). From night_start until the first
 night_off_gate_time after it a room that needs heat gets "night" mode instead of
-"up": +1 steps only until the run reaches min_run_min (a warm room or a shutoff
-night is "down" as always). If the compressor stays off longer than max_pause_min with
+"up": +1 steps only until the run reaches min_run_min (a warm room or a night
+without shutoff by the forecast is "down" as always). If the compressor stays off longer than max_pause_min with
 the shift below normal and the room not warmer than the indoor target, the shift
 goes back to normal so that it restarts on its own (no shift down again until
 the compressor has run). Cold (shared outdoor settings, DEFAULT_OUTDOOR): the
@@ -993,27 +993,26 @@ class Tuner:
             and RESEND_AFTER <= now - sent <= CONFIRM_TIMEOUT
         )
 
-    def _night_down(self, entry: dict[str, Any], obs: Observation) -> bool:
-        """Night hours with a shutoff planned or running ("down" mode); otherwise the room decides."""
+    def _night_down(self, entry: dict[str, Any], obs: Observation) -> str | None:
+        """Night hours without a shutoff because of the forecast thresholds ("down" mode, with the reason);
+        otherwise (shutoff night, switch off, no forecast) the room decides."""
         s = entry["settings"]
         window = night_window(s, obs.now)
         if not s["night_off"] or window is None or not window[0] <= obs.now < window[1]:
-            return False
-        no = entry["state"].get("night_off") or {}
-        if no.get("night") == _iso(window[0]) and (no.get("done") or no.get("gate")):
-            return False  # back on: 6am gate, turned on elsewhere, unit did not turn off
-        if s["night_off_dynamic"] and not no.get("active") and obs.now >= dynamic_window(s, window)[1]:
-            return False  # dynamic start not reached: no shutoff this night
+            return None
         # the forecast of the last night-off evaluation (one location for all devices)
         fc = next((v.get("forecast") for v in self._night_live.values()), None)
-        return bool(no.get("active")) or night_off_conditions(s, fc)[0]
+        if not fc or fc.get("mean") is None or fc.get("night_min") is None:
+            return None
+        ok, why = night_off_conditions(s, fc)
+        return None if ok else f"night {s['night_start']}–{s['night_end']} without shutoff ({why})"
 
     @staticmethod
     def _mode(
         s: dict[str, Any],
         obs: Observation,
         early_off: str | None = None,
-        night_down: bool = False,
+        night_down: str | None = None,
         cold: str | None = None,
     ) -> tuple[str, str]:
         if cold is not None:
@@ -1021,7 +1020,7 @@ class Tuner:
         if early_off is not None:
             return "down", early_off
         if night_down:
-            return "down", f"night {s['night_start']}–{s['night_end']}"
+            return "down", night_down
         if obs.indoor is None:
             return "hold", "indoor temperature unavailable"
         if obs.indoor > s["indoor_target"]:
